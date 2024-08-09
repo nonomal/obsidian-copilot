@@ -11,11 +11,13 @@ export enum ChatModels {
   GPT_35_TURBO_16K = "gpt-3.5-turbo-16k",
   GPT_4 = "gpt-4",
   GPT_4o = "gpt-4o",
+  GPT_4o_mini = "gpt-4o-mini",
   GPT_4_TURBO = "gpt-4-turbo-preview",
   GPT_4_32K = "gpt-4-32k",
-  GEMINI_PRO = "gemini-pro",
+  GEMINI_PRO = "gemini-1.5-pro",
+  GEMINI_FLASH = "gemini-1.5-flash",
+  GROQ = "llama3-70b-8192",
   OLLAMA = "ollama",
-  Groq = "llama3-70b-8192",
 }
 
 export enum ChatModelDisplayNames {
@@ -23,15 +25,17 @@ export enum ChatModelDisplayNames {
   GPT_35_TURBO_16K = "GPT-3.5 16K",
   GPT_4 = "GPT-4",
   GPT_4o = "GPT-4o",
+  GPT_4o_mini = "GPT-4o mini",
   GPT_4_TURBO = "GPT-4 TURBO",
   GPT_4_32K = "GPT-4 32K",
   AZURE_OPENAI = "AZURE OPENAI",
-  CLAUDE = "CLAUDE 3",
-  GEMINI_PRO = "GEMINI PRO",
+  CLAUDE = "CLAUDE",
+  GEMINI_PRO = "GEMINI 1.5 PRO",
+  GEMINI_FLASH = "GEMINI 1.5 FLASH",
   OPENROUTERAI = "OPENROUTER.AI",
+  GROQ = "GROQ",
   OLLAMA = "OLLAMA (LOCAL)",
   LM_STUDIO = "LM STUDIO (LOCAL)",
-  GROQ = "Groq",
 }
 
 export const OPENAI_MODELS = new Set([
@@ -39,6 +43,7 @@ export const OPENAI_MODELS = new Set([
   ChatModelDisplayNames.GPT_35_TURBO_16K,
   ChatModelDisplayNames.GPT_4,
   ChatModelDisplayNames.GPT_4o,
+  ChatModelDisplayNames.GPT_4o_mini,
   ChatModelDisplayNames.GPT_4_TURBO,
   ChatModelDisplayNames.GPT_4_32K,
   ChatModelDisplayNames.LM_STUDIO,
@@ -46,7 +51,10 @@ export const OPENAI_MODELS = new Set([
 
 export const AZURE_MODELS = new Set([ChatModelDisplayNames.AZURE_OPENAI]);
 
-export const GOOGLE_MODELS = new Set([ChatModelDisplayNames.GEMINI_PRO]);
+export const GOOGLE_MODELS = new Set([
+  ChatModelDisplayNames.GEMINI_PRO,
+  ChatModelDisplayNames.GEMINI_FLASH
+]);
 
 export const ANTHROPIC_MODELS = new Set([ChatModelDisplayNames.CLAUDE]);
 
@@ -63,10 +71,12 @@ export const DISPLAY_NAME_TO_MODEL: Record<string, string> = {
   [ChatModelDisplayNames.GPT_35_TURBO_16K]: ChatModels.GPT_35_TURBO_16K,
   [ChatModelDisplayNames.GPT_4]: ChatModels.GPT_4,
   [ChatModelDisplayNames.GPT_4o]: ChatModels.GPT_4o,
+  [ChatModelDisplayNames.GPT_4o_mini]: ChatModels.GPT_4o_mini,
   [ChatModelDisplayNames.GPT_4_TURBO]: ChatModels.GPT_4_TURBO,
   [ChatModelDisplayNames.GPT_4_32K]: ChatModels.GPT_4_32K,
   [ChatModelDisplayNames.AZURE_OPENAI]: "azure_openai",
   [ChatModelDisplayNames.GEMINI_PRO]: ChatModels.GEMINI_PRO,
+  [ChatModelDisplayNames.GEMINI_FLASH]: ChatModels.GEMINI_FLASH,
 };
 
 export const GROQ_MODELS = new Set([ChatModelDisplayNames.GROQ]);
@@ -148,7 +158,7 @@ export const DEFAULT_SETTINGS: CopilotSettings = {
   huggingfaceApiKey: "",
   cohereApiKey: "",
   anthropicApiKey: "",
-  anthropicModel: "claude-3-sonnet-20240229",
+  anthropicModel: "claude-3-5-sonnet-20240620",
   azureOpenAIApiKey: "",
   azureOpenAIApiInstanceName: "",
   azureOpenAIApiDeploymentName: "",

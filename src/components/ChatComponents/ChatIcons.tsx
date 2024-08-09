@@ -171,6 +171,9 @@ const ChatIcons: React.FC<ChatIconsProps> = ({
             <option value={ChatModelDisplayNames.GPT_4o}>
               {ChatModelDisplayNames.GPT_4o}
             </option>
+            <option value={ChatModelDisplayNames.GPT_4o_mini}>
+              {ChatModelDisplayNames.GPT_4o_mini}
+            </option>
             <option value={ChatModelDisplayNames.GPT_4_TURBO}>
               {ChatModelDisplayNames.GPT_4_TURBO}
             </option>
@@ -186,17 +189,20 @@ const ChatIcons: React.FC<ChatIconsProps> = ({
             <option value={ChatModelDisplayNames.GEMINI_PRO}>
               {ChatModelDisplayNames.GEMINI_PRO}
             </option>
+            <option value={ChatModelDisplayNames.GEMINI_FLASH}>
+              {ChatModelDisplayNames.GEMINI_FLASH}
+            </option>
             <option value={ChatModelDisplayNames.OPENROUTERAI}>
               {ChatModelDisplayNames.OPENROUTERAI}
+            </option>
+            <option value={ChatModelDisplayNames.GROQ}>
+              {ChatModelDisplayNames.GROQ}
             </option>
             <option value={ChatModelDisplayNames.LM_STUDIO}>
               {ChatModelDisplayNames.LM_STUDIO}
             </option>
             <option value={ChatModelDisplayNames.OLLAMA}>
               {ChatModelDisplayNames.OLLAMA}
-            </option>
-            <option value={ChatModelDisplayNames.GROQ}>
-              {ChatModelDisplayNames.GROQ}
             </option>
           </select>
           <span className="tooltip-text">Model Selection</span>
