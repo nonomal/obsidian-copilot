@@ -1,185 +1,902 @@
-import { CopilotSettings } from "@/settings/SettingsPage";
+import { CustomModel } from "@/aiParams";
+import { type CopilotSettings } from "@/settings/model";
+import { v4 as uuidv4 } from "uuid";
+import { ChainType } from "./chainType";
+import { PromptSortStrategy } from "./types";
 
+// Copilot website usage dashboard (view usage, purchase credits). Used as the
+// fallback link when a usage-cap error doesn't carry its own dashboard_url.
+export const USAGE_DASHBOARD_URL = "https://www.obsidiancopilot.com/en/dashboard/token-usage";
+
+export const BREVILABS_API_BASE_URL = "https://api.brevilabs.com/v1";
+export const BREVILABS_MODELS_BASE_URL = "https://models.brevilabs.com/v1";
 export const CHAT_VIEWTYPE = "copilot-chat-view";
+export const CHAT_AGENT_VIEWTYPE = "copilot-agent-chat-view";
+export const AGENT_CHAT_MODE = "agent";
+export const RELEVANT_NOTES_VIEWTYPE = "copilot-relevant-notes-view";
+
+// Custom Obsidian icon for Agent Mode surfaces (view tab, ribbon, commands).
+// The v4 monochrome brand mark, normalized from its source viewBox "4 4 152 127"
+// into Obsidian's 0 0 100 100 icon space; currentColor lets it track the theme
+// and the active/hover tab state instead of a fixed fill. Register via addIcon().
+export const COPILOT_AGENT_ICON_ID = "copilot-agent";
+
+// The brand glyph as raw vector data — the single source of truth shared by the
+// native `addIcon` registration (string) and the `CopilotBrandIcon` React
+// component (JSX). Both derive from these primitives, so they cannot drift.
+// The 0 0 100 100 viewBox is intentionally NOT shared here: `addIcon` always
+// wraps its content in Obsidian's own `<svg viewBox="0 0 100 100">`, so that box
+// is fixed by the Obsidian API, not chosen by us — `CopilotBrandIcon` simply
+// matches it. If a future review flags the hardcoded viewBox, point them here.
+export const COPILOT_AGENT_ICON_TRANSFORM = "translate(0 8.2) scale(0.6579) translate(-4 -4)";
+export const COPILOT_AGENT_ICON_PATH =
+  "M75.9 6.9c-6.8 1.4-12.5 6-35.5 29.3-33.5 33.8-33.5 33.9-34.2 62.2-0.3 12.4 0 20.2 0.7 22.7 2.4 7.8 10.8 11.2 17.6 7.1 1.7-1.1 14.9-14.1 29.5-29.1 14.5-14.9 26.7-27 27-26.9 0.3 0.2 12.4 12.4 27 27.3 14.6 14.8 27.6 27.8 29 28.7 5.1 3.6 13.6 1.4 16.5-4.2 1.2-2.3 1.5-6.9 1.5-22.3 0-22.9-1.2-28.6-8.3-37.9-7.6-10.2-50-52.3-54.9-54.6-5.1-2.4-10.9-3.2-15.9-2.3z";
+
+// Inner SVG markup string consumed by Obsidian's `addIcon` (which wraps it in an
+// `<svg viewBox="0 0 100 100">`). Built from the shared primitives above.
+export const COPILOT_AGENT_ICON_SVG = `<g transform="${COPILOT_AGENT_ICON_TRANSFORM}"><path fill="currentColor" d="${COPILOT_AGENT_ICON_PATH}"/></g>`;
+
 export const USER_SENDER = "user";
 export const AI_SENDER = "ai";
-export const DEFAULT_SYSTEM_PROMPT =
-  "You are Obsidian Copilot, a helpful assistant that integrates AI to Obsidian note-taking.";
+
+// Default folder names
+export const COPILOT_FOLDER_ROOT = "copilot";
+// Configurable root all Copilot sub-folders derive from (PR-乙). Defaults to
+// the historical hardcoded root so existing vaults keep their layout.
+export const DEFAULT_COPILOT_FOLDER = COPILOT_FOLDER_ROOT;
+const DEFAULT_CHAT_HISTORY_FOLDER = `${COPILOT_FOLDER_ROOT}/copilot-conversations`;
+const DEFAULT_CUSTOM_PROMPTS_FOLDER = `${COPILOT_FOLDER_ROOT}/copilot-custom-prompts`;
+const DEFAULT_MEMORY_FOLDER = `${COPILOT_FOLDER_ROOT}/memory`;
+const DEFAULT_SYSTEM_PROMPTS_FOLDER = `${COPILOT_FOLDER_ROOT}/system-prompts`;
+const DEFAULT_PROJECTS_FOLDER = `${COPILOT_FOLDER_ROOT}/projects`;
+export const DEFAULT_SKILLS_FOLDER = `${COPILOT_FOLDER_ROOT}/skills`;
+const DEFAULT_CONVERTED_DOC_OUTPUT_FOLDER = "";
+// Built-in tag written into every saved conversation's frontmatter. Frozen as a
+// constant: no code reads the tag to identify conversations — they are keyed by
+// folder + epoch — so built-in history is unaffected by the freeze.
+//
+// DESIGN NOTE (accepted compatibility break): a vault that had customized the
+// old `defaultConversationTag` keeps that value in data.json, but it is no
+// longer read, and existing notes are never rewritten. Such a vault therefore
+// ends up with two markers, and the user's own tag-based queries, searches and
+// automations see only the older half. That cost was accepted deliberately to
+// converge on one built-in marker; grandfathering the persisted value was
+// rejected because a hidden setting would then steer output forever. Batch
+// remediation is tracked in obsidian-copilot-preview#224.
+// If a future review flags this again, point them at this note.
+export const COPILOT_CONVERSATION_TAG = "copilot-conversation";
+export const DEFAULT_QA_EXCLUSIONS_SETTING = COPILOT_FOLDER_ROOT;
+export const DEFAULT_SYSTEM_PROMPT = `You are Obsidian Copilot, a helpful assistant that integrates AI to Obsidian note-taking.
+  1. Never mention that you do not have access to something. Always rely on the user provided context.
+  2. Always answer to the best of your knowledge. If you are unsure about something, say so and ask the user to provide more context.
+  3. If the user mentions "note", it most likely means an Obsidian note in the vault, not the generic meaning of a note.
+  4. If the user mentions "@vault", it means the user wants you to search the Obsidian vault for information relevant to the query. The search results will be provided to you in the context along with the user query, read it carefully and answer the question based on the information provided. If there's no relevant information in the vault, just say so.
+  5. If the user mentions any other tool with the @ symbol, check the context for their results. If nothing is found, just ignore the @ symbol in the query.
+  6. Always use $'s instead of \\[ etc. for LaTeX equations.
+  7. When showing note titles, use [[title]] format and do not wrap them in \` \`.
+  8. When showing **Obsidian internal** image links, use ![[link]] format and do not wrap them in \` \`.
+  9. When showing **web** image links, use ![link](url) format and do not wrap them in \` \`.
+  10. When generating a table, format as github markdown tables, however, for table headings, immediately add ' |' after the table heading.
+  11. Always respond in the language of the user's query.
+  12. Do NOT mention the additional context provided such as getCurrentTime and getTimeRangeMs if it's irrelevant to the user message.
+  13. If the user mentions "tags", it most likely means tags in Obsidian note properties.
+  14. YouTube URLs: If the user provides YouTube URLs in their message, transcriptions will be automatically fetched and provided to you. You don't need to do anything special - just use the transcription content if available.`;
+
+export const COMPOSER_OUTPUT_INSTRUCTIONS = `Return the new note content or canvas JSON in <writeFile> tags.
+
+  # Steps to find the the target notes
+  1. Extract the target note information from user message and find out the note path from the context below.
+  2. If target note is not specified, use the <active_note> as the target note.
+  3. If still failed to find the target note or the note path, ask the user to specify the target note.
+
+  # Examples
+
+  Input: Add a new section to note A
+  Output:
+  <writeFile>
+  <path>path/to/file.md</path>
+  <content>The FULL CONTENT of the note A with added section goes here</content>
+  </writeFile>
+
+  Input: Create a new canvas with "Hello, world!"
+  Output:
+  <writeFile>
+  <path>path/to/file.canvas</path>
+  <content>
+  {
+    "nodes": [
+      {
+        "id": "1",
+        "type": "text",
+        "text": "Hello, world!",
+        "x": 0,
+        "y": 0,
+        "width": 200,
+        "height": 50
+      }
+    ],
+    "edges": []
+  }
+  </content>
+  </writeFile>
+
+  Input: Create a canvas with a file node and a group
+  Output:
+  <writeFile>
+  <path>path/to/file.canvas</path>
+  <content>
+  {
+    "nodes": [
+      {"id": "1", "type": "file", "file": "note.md", "subpath": "#heading", "x": 100, "y": 100, "width": 300, "height": 200, "color": "2"},
+      {"id": "2", "type": "group", "label": "My Group", "x": 50, "y": 50, "width": 400, "height": 300, "color": "1"},
+      {"id": "3", "type": "link", "url": "https://example.com", "x": 500, "y": 100, "width": 200, "height": 100, "color": "#FF5733"}
+    ],
+    "edges": [
+      {"id": "e1-2", "fromNode": "1", "toNode": "3", "fromSide": "right", "toSide": "left", "fromEnd": "arrow", "toEnd": "none", "color": "3", "label": "references"}
+    ]
+  }
+  </content>
+  </writeFile>
+
+  # Canvas JSON Format (JSON Canvas spec 1.0)
+  Required node fields: id, type, x, y, width, height
+  Node types: "text" (needs text), "file" (needs file), "link" (needs url), "group" (optional label)
+  Optional node fields: color (hex #FF0000 or preset "1"-"6"), subpath (file nodes, starts with #)
+  Required edge fields: id, fromNode, toNode
+  Optional edge fields: fromSide/toSide ("top"/"right"/"bottom"/"left"), fromEnd/toEnd ("none"/"arrow"), color, label
+  All IDs must be unique. Edge nodes must reference existing node IDs.
+  Position nodes with reasonable spacing and logical visual flow.
+  `;
+
+export const NOTE_CONTEXT_PROMPT_TAG = "note_context";
+export const SELECTED_TEXT_TAG = "selected_text";
+export const WEB_SELECTED_TEXT_TAG = "web_selected_text";
+export const VARIABLE_TAG = "variable";
+export const VARIABLE_NOTE_TAG = "variable_note";
+export const EMBEDDED_PDF_TAG = "embedded_pdf";
+export const EMBEDDED_NOTE_TAG = "embedded_note";
+export const DATAVIEW_BLOCK_TAG = "dataview_block";
+export const WEB_TAB_CONTEXT_TAG = "web_tab_context";
+export const ACTIVE_WEB_TAB_CONTEXT_TAG = "active_web_tab";
+export const YOUTUBE_VIDEO_CONTEXT_TAG = "youtube_video_context";
+/** Marker text used as placeholder for active web tab in serialized content */
+export const ACTIVE_WEB_TAB_MARKER = "{activeWebTab}";
+export const CHUNK_SIZE = 6000;
+export const TEXT_WEIGHT = 0.4;
+export const MAX_CHARS_FOR_LOCAL_SEARCH_CONTEXT = 448000;
+export const LLM_TIMEOUT_MS = 30000; // 30 seconds timeout for LLM operations
+const DEFAULT_MAX_SOURCE_CHUNKS = 30; // Default max chunks for search results (with diverse top-K)
+export const AGENT_LOOP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes timeout for agent loop
+export const LOADING_MESSAGES = {
+  DEFAULT: "",
+  READING_FILES: "Reading files",
+  SEARCHING_WEB: "Searching the web",
+  READING_FILE_TREE: "Reading file tree",
+  COMPACTING: "Compacting",
+};
+export const PLUS_UTM_MEDIUMS = {
+  SETTINGS: "settings",
+  EXPIRED_MODAL: "expired_modal",
+  CHAT_MODE_SELECT: "chat_mode_select",
+  MODE_SELECT_TOOLTIP: "mode_select_tooltip",
+  MULTI_AGENT: "multi_agent",
+};
+export type PlusUtmMedium = (typeof PLUS_UTM_MEDIUMS)[keyof typeof PLUS_UTM_MEDIUMS];
+
+/**
+ * Reasoning effort levels for OpenAI reasoning models
+ */
+export enum ReasoningEffort {
+  MINIMAL = "minimal",
+  LOW = "low",
+  MEDIUM = "medium",
+  HIGH = "high",
+  XHIGH = "xhigh",
+}
+
+/**
+ * Output verbosity levels for GPT-5 models
+ */
+export enum Verbosity {
+  LOW = "low",
+  MEDIUM = "medium",
+  HIGH = "high",
+}
+
+/**
+ * Output length to request from Anthropic, the one provider that will not
+ * accept "no limit".
+ *
+ * Every other provider lets the parameter be left out and then writes whatever
+ * fits the context window, which is the better answer. Anthropic's client
+ * substitutes its own per-model default instead, and for a model id it does not
+ * recognize that default is 4,096.
+ *
+ * 20,000 tokens is about 15,000 words, longer than a chat answer runs. Two
+ * ceilings rule out a larger number.
+ *
+ * The Anthropic SDK rejects a non-streaming request it estimates will take over
+ * ten minutes, and it throws before sending anything. Its estimate is
+ * `60min * maxTokens / 128_000`, which puts the limit at 21,333 tokens.
+ *
+ * A provider also rejects a request whose prompt and requested output together
+ * exceed the context window, so this value has to leave room for a long
+ * conversation.
+ *
+ * https://github.com/logancyang/obsidian-copilot-preview/issues/312
+ */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
+
+export const DEFAULT_MODEL_SETTING = {
+  TEMPERATURE: 0.1,
+  REASONING_EFFORT: ReasoningEffort.LOW,
+  VERBOSITY: Verbosity.MEDIUM,
+} as const;
+
+// Reason: Ollama defaults to a small context window (2048). We override to 131072
+// for backward compatibility (PR #2147), configurable via UI (#2275).
+export const DEFAULT_OLLAMA_NUM_CTX = 131072;
 
 export enum ChatModels {
-  GPT_35_TURBO = "gpt-3.5-turbo",
-  GPT_35_TURBO_16K = "gpt-3.5-turbo-16k",
-  GPT_4 = "gpt-4",
-  GPT_4o = "gpt-4o",
-  GPT_4_TURBO = "gpt-4-turbo-preview",
-  GPT_4_32K = "gpt-4-32k",
-  GEMINI_PRO = "gemini-pro",
-  OLLAMA = "ollama",
-  Groq = "llama3-70b-8192",
+  COPILOT_PLUS_FLASH = "copilot-plus-flash",
+  // Additional Copilot Plus relay models (served via the brevilabs proxy).
+  COPILOT_PLUS_KIMI_K2_6 = "kimi-k2.6",
+  COPILOT_PLUS_GLM_5_2 = "glm-5.2",
+  COPILOT_PLUS_KIMI_K2_7_CODE = "kimi-k2.7-code",
+  COPILOT_PLUS_DEEPSEEK_V4_PRO = "deepseek-v4-pro",
+  COPILOT_PLUS_DEEPSEEK_V4_FLASH_0731 = "deepseek-v4-flash-0731",
+  COPILOT_PLUS_MIMO_V2_5 = "mimo-v2.5",
+  COPILOT_PLUS_MINIMAX_M2_7 = "minimax-m2.7",
+  GPT_5_5 = "gpt-5.5",
+  GPT_5_4_mini = "gpt-5.4-mini",
+  GPT_41 = "gpt-4.1",
+  GPT_41_mini = "gpt-4.1-mini",
+  GEMINI_3_PRO_PREVIEW = "gemini-3.1-pro-preview",
+  GEMINI_3_5_FLASH = "gemini-3.5-flash",
+  GEMINI_3_FLASH_LITE = "gemini-3.1-flash-lite",
+  GEMINI_PRO = "gemini-2.5-pro",
+  GEMINI_FLASH = "gemini-2.5-flash",
+  CLAUDE_OPUS_4_7 = "claude-opus-4-7",
+  CLAUDE_SONNET_4_6 = "claude-sonnet-4-6",
+  CLAUDE_HAIKU_4_5 = "claude-haiku-4-5",
+  GROK_4_3 = "grok-4.3",
+  GROQ_LLAMA_8b = "llama3-8b-8192",
+  COMMAND_R = "command-r",
+  MISTRAL_TINY = "mistral-tiny-latest",
+  DEEPSEEK_REASONER = "deepseek-reasoner",
+  DEEPSEEK_CHAT = "deepseek-chat",
+  OPENROUTER_GEMINI_3_5_FLASH = "google/gemini-3.5-flash",
+  OPENROUTER_GEMINI_3_PRO_PREVIEW = "google/gemini-3.1-pro-preview",
+  OPENROUTER_GEMINI_2_5_FLASH = "google/gemini-2.5-flash",
+  OPENROUTER_GEMINI_2_5_PRO = "google/gemini-2.5-pro",
+  OPENROUTER_GPT_5_5 = "openai/gpt-5.5",
+  OPENROUTER_GPT_5_4_MINI = "openai/gpt-5.4-mini",
+  OPENROUTER_GROK_4_3 = "x-ai/grok-4.3",
+  SILICONFLOW_DEEPSEEK_V3 = "deepseek-ai/DeepSeek-V3",
+  SILICONFLOW_DEEPSEEK_R1 = "deepseek-ai/DeepSeek-R1",
 }
-
-export enum ChatModelDisplayNames {
-  GPT_35_TURBO = "GPT-3.5",
-  GPT_35_TURBO_16K = "GPT-3.5 16K",
-  GPT_4 = "GPT-4",
-  GPT_4o = "GPT-4o",
-  GPT_4_TURBO = "GPT-4 TURBO",
-  GPT_4_32K = "GPT-4 32K",
-  AZURE_OPENAI = "AZURE OPENAI",
-  CLAUDE = "CLAUDE 3",
-  GEMINI_PRO = "GEMINI PRO",
-  OPENROUTERAI = "OPENROUTER.AI",
-  OLLAMA = "OLLAMA (LOCAL)",
-  LM_STUDIO = "LM STUDIO (LOCAL)",
-  GROQ = "Groq",
-}
-
-export const OPENAI_MODELS = new Set([
-  ChatModelDisplayNames.GPT_35_TURBO,
-  ChatModelDisplayNames.GPT_35_TURBO_16K,
-  ChatModelDisplayNames.GPT_4,
-  ChatModelDisplayNames.GPT_4o,
-  ChatModelDisplayNames.GPT_4_TURBO,
-  ChatModelDisplayNames.GPT_4_32K,
-  ChatModelDisplayNames.LM_STUDIO,
-]);
-
-export const AZURE_MODELS = new Set([ChatModelDisplayNames.AZURE_OPENAI]);
-
-export const GOOGLE_MODELS = new Set([ChatModelDisplayNames.GEMINI_PRO]);
-
-export const ANTHROPIC_MODELS = new Set([ChatModelDisplayNames.CLAUDE]);
-
-export const OPENROUTERAI_MODELS = new Set([
-  ChatModelDisplayNames.OPENROUTERAI,
-]);
-
-export const OLLAMA_MODELS = new Set([ChatModelDisplayNames.OLLAMA]);
-
-export const LM_STUDIO_MODELS = new Set([ChatModelDisplayNames.LM_STUDIO]);
-
-export const DISPLAY_NAME_TO_MODEL: Record<string, string> = {
-  [ChatModelDisplayNames.GPT_35_TURBO]: ChatModels.GPT_35_TURBO,
-  [ChatModelDisplayNames.GPT_35_TURBO_16K]: ChatModels.GPT_35_TURBO_16K,
-  [ChatModelDisplayNames.GPT_4]: ChatModels.GPT_4,
-  [ChatModelDisplayNames.GPT_4o]: ChatModels.GPT_4o,
-  [ChatModelDisplayNames.GPT_4_TURBO]: ChatModels.GPT_4_TURBO,
-  [ChatModelDisplayNames.GPT_4_32K]: ChatModels.GPT_4_32K,
-  [ChatModelDisplayNames.AZURE_OPENAI]: "azure_openai",
-  [ChatModelDisplayNames.GEMINI_PRO]: ChatModels.GEMINI_PRO,
-};
-
-export const GROQ_MODELS = new Set([ChatModelDisplayNames.GROQ]);
 
 // Model Providers
-export enum ModelProviders {
+export enum ChatModelProviders {
+  OPENROUTERAI = "openrouterai",
   OPENAI = "openai",
-  HUGGINGFACE = "huggingface",
-  COHEREAI = "cohereai",
-  AZURE_OPENAI = "azure_openai",
+  OPENAI_FORMAT = "3rd party (openai-format)",
   ANTHROPIC = "anthropic",
   GOOGLE = "google",
-  OPENROUTERAI = "openrouterai",
-  LM_STUDIO = "lm_studio",
-  OLLAMA = "ollama",
+  XAI = "xai",
   GROQ = "groq",
-}
-
-export const VENDOR_MODELS: Record<string, Set<string>> = {
-  [ModelProviders.OPENAI]: OPENAI_MODELS,
-  [ModelProviders.AZURE_OPENAI]: AZURE_MODELS,
-  [ModelProviders.GOOGLE]: GOOGLE_MODELS,
-  [ModelProviders.ANTHROPIC]: ANTHROPIC_MODELS,
-  [ModelProviders.OPENROUTERAI]: OPENROUTERAI_MODELS,
-  [ModelProviders.OLLAMA]: OLLAMA_MODELS,
-  [ModelProviders.LM_STUDIO]: LM_STUDIO_MODELS,
-  [ModelProviders.GROQ]: GROQ_MODELS,
-};
-
-export const EMBEDDING_PROVIDERS = [
-  ModelProviders.OPENAI,
-  ModelProviders.AZURE_OPENAI,
-  ModelProviders.COHEREAI,
-  ModelProviders.HUGGINGFACE,
-  ModelProviders.OLLAMA,
-];
-
-export enum EmbeddingModels {
-  OPENAI_EMBEDDING_ADA_V2 = "text-embedding-ada-002",
-  OPENAI_EMBEDDING_SMALL = "text-embedding-3-small",
-  OPENAI_EMBEDDING_LARGE = "text-embedding-3-large",
-  AZURE_OPENAI = "azure-openai",
+  OLLAMA = "ollama",
+  LM_STUDIO = "lm-studio",
+  COPILOT_PLUS = "copilot-plus",
+  MISTRAL = "mistralai",
+  DEEPSEEK = "deepseek",
   COHEREAI = "cohereai",
-  OLLAMA_NOMIC = "ollama-nomic-embed-text",
+  SILICONFLOW = "siliconflow",
 }
 
-export const EMBEDDING_MODEL_TO_PROVIDERS: Record<string, string> = {
-  [EmbeddingModels.OPENAI_EMBEDDING_ADA_V2]: ModelProviders.OPENAI,
-  [EmbeddingModels.OPENAI_EMBEDDING_SMALL]: ModelProviders.OPENAI,
-  [EmbeddingModels.OPENAI_EMBEDDING_LARGE]: ModelProviders.OPENAI,
-  [EmbeddingModels.AZURE_OPENAI]: ModelProviders.AZURE_OPENAI,
-  [EmbeddingModels.COHEREAI]: ModelProviders.COHEREAI,
-  [EmbeddingModels.OLLAMA_NOMIC]: ModelProviders.OLLAMA,
+export enum ModelCapability {
+  REASONING = "reasoning",
+  VISION = "vision",
+  WEB_SEARCH = "websearch",
+}
+
+export const MODEL_CAPABILITIES: Record<ModelCapability, string> = {
+  reasoning: "This model supports general reasoning tasks.",
+  vision: "This model supports image inputs.",
+  websearch: "This model can access the internet.",
 };
 
-// Embedding Models
-export const NOMIC_EMBED_TEXT = "nomic-embed-text";
-// export const DISTILBERT_NLI = 'sentence-transformers/distilbert-base-nli-mean-tokens';
-// export const INSTRUCTOR_XL = 'hkunlp/instructor-xl'; // Inference API is off for this
-// export const MPNET_V2 = 'sentence-transformers/all-mpnet-base-v2'; // Inference API returns 400
-
-export enum VAULT_VECTOR_STORE_STRATEGY {
-  NEVER = "NEVER",
-  ON_STARTUP = "ON STARTUP",
-  ON_MODE_SWITCH = "ON MODE SWITCH",
-}
-
-export const VAULT_VECTOR_STORE_STRATEGIES = [
-  VAULT_VECTOR_STORE_STRATEGY.NEVER,
-  VAULT_VECTOR_STORE_STRATEGY.ON_STARTUP,
-  VAULT_VECTOR_STORE_STRATEGY.ON_MODE_SWITCH,
+export const BUILTIN_CHAT_MODELS: CustomModel[] = [
+  // Enabled models first
+  {
+    name: ChatModels.COPILOT_PLUS_FLASH,
+    provider: ChatModelProviders.COPILOT_PLUS,
+    enabled: true,
+    isBuiltIn: true,
+    core: true,
+    plusExclusive: true,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.OPENROUTER_GEMINI_2_5_FLASH,
+    provider: ChatModelProviders.OPENROUTERAI,
+    enabled: true,
+    isBuiltIn: true,
+    core: true,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.OPENROUTER_GEMINI_3_5_FLASH,
+    provider: ChatModelProviders.OPENROUTERAI,
+    enabled: true,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION, ModelCapability.REASONING],
+  },
+  {
+    name: ChatModels.GPT_5_5,
+    provider: ChatModelProviders.OPENAI,
+    enabled: true,
+    isBuiltIn: true,
+    core: true,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.GPT_5_4_mini,
+    provider: ChatModelProviders.OPENAI,
+    enabled: true,
+    isBuiltIn: true,
+    core: true,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.CLAUDE_SONNET_4_6,
+    provider: ChatModelProviders.ANTHROPIC,
+    enabled: true,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION, ModelCapability.REASONING],
+  },
+  {
+    name: ChatModels.GEMINI_3_5_FLASH,
+    provider: ChatModelProviders.GOOGLE,
+    enabled: true,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION, ModelCapability.REASONING],
+  },
+  {
+    name: ChatModels.GEMINI_3_FLASH_LITE,
+    provider: ChatModelProviders.GOOGLE,
+    enabled: true,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.GEMINI_FLASH,
+    provider: ChatModelProviders.GOOGLE,
+    enabled: true,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION],
+  },
+  // Disabled models
+  {
+    name: ChatModels.OPENROUTER_GEMINI_3_PRO_PREVIEW,
+    provider: ChatModelProviders.OPENROUTERAI,
+    enabled: false,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION, ModelCapability.REASONING],
+  },
+  {
+    name: ChatModels.OPENROUTER_GEMINI_2_5_PRO,
+    provider: ChatModelProviders.OPENROUTERAI,
+    enabled: false,
+    isBuiltIn: true,
+    core: false,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.OPENROUTER_GPT_5_5,
+    provider: ChatModelProviders.OPENROUTERAI,
+    enabled: false,
+    isBuiltIn: true,
+    core: false,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.OPENROUTER_GPT_5_4_MINI,
+    provider: ChatModelProviders.OPENROUTERAI,
+    enabled: false,
+    isBuiltIn: true,
+    core: false,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.GROK_4_3,
+    provider: ChatModelProviders.XAI,
+    enabled: false,
+    isBuiltIn: true,
+    core: false,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.OPENROUTER_GROK_4_3,
+    provider: ChatModelProviders.OPENROUTERAI,
+    enabled: false,
+    isBuiltIn: true,
+    core: false,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.GPT_41,
+    provider: ChatModelProviders.OPENAI,
+    enabled: false,
+    isBuiltIn: true,
+    core: false,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.GPT_41_mini,
+    provider: ChatModelProviders.OPENAI,
+    enabled: false,
+    isBuiltIn: true,
+    core: false,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.CLAUDE_OPUS_4_7,
+    provider: ChatModelProviders.ANTHROPIC,
+    enabled: false,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION, ModelCapability.REASONING],
+  },
+  {
+    name: ChatModels.CLAUDE_HAIKU_4_5,
+    provider: ChatModelProviders.ANTHROPIC,
+    enabled: false,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION, ModelCapability.REASONING],
+  },
+  {
+    name: ChatModels.GEMINI_3_PRO_PREVIEW,
+    provider: ChatModelProviders.GOOGLE,
+    enabled: false,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION, ModelCapability.REASONING],
+  },
+  {
+    name: ChatModels.GEMINI_PRO,
+    provider: ChatModelProviders.GOOGLE,
+    enabled: false,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.VISION],
+  },
+  {
+    name: ChatModels.DEEPSEEK_CHAT,
+    provider: ChatModelProviders.DEEPSEEK,
+    enabled: false,
+    isBuiltIn: true,
+  },
+  {
+    name: ChatModels.DEEPSEEK_REASONER,
+    provider: ChatModelProviders.DEEPSEEK,
+    enabled: false,
+    isBuiltIn: true,
+    capabilities: [ModelCapability.REASONING],
+  },
+  {
+    name: ChatModels.SILICONFLOW_DEEPSEEK_V3,
+    provider: ChatModelProviders.SILICONFLOW,
+    enabled: false,
+    isBuiltIn: false,
+    baseUrl: "https://api.siliconflow.com/v1",
+  },
+  {
+    name: ChatModels.SILICONFLOW_DEEPSEEK_R1,
+    provider: ChatModelProviders.SILICONFLOW,
+    enabled: false,
+    isBuiltIn: false,
+    baseUrl: "https://api.siliconflow.com/v1",
+    capabilities: [ModelCapability.REASONING],
+  },
 ];
 
-export const PROXY_SERVER_PORT = 53001;
+export type Provider = ChatModelProviders;
+
+export type SettingKeyProviders = Exclude<
+  ChatModelProviders,
+  ChatModelProviders.OPENAI_FORMAT | ChatModelProviders.LM_STUDIO | ChatModelProviders.OLLAMA
+>;
+
+// Provider metadata interface
+export interface ProviderMetadata {
+  label: string;
+  host: string;
+  /**
+   * Base URL used when generating example curl commands (and UI placeholders).
+   * This must be deterministic and must NOT include endpoint suffixes like `/chat/completions`.
+   * It intentionally does not affect runtime SDK configuration.
+   */
+  curlBaseURL: string;
+  keyManagementURL: string;
+  testModel?: ChatModels;
+}
+
+// Unified provider information
+export const ProviderInfo: Record<Provider, ProviderMetadata> = {
+  [ChatModelProviders.OPENROUTERAI]: {
+    label: "OpenRouter",
+    host: "https://openrouter.ai/api/v1/",
+    curlBaseURL: "https://openrouter.ai/api/v1",
+    keyManagementURL: "https://openrouter.ai/keys",
+    testModel: ChatModels.OPENROUTER_GPT_5_4_MINI,
+  },
+  [ChatModelProviders.GOOGLE]: {
+    label: "Gemini",
+    host: "https://generativelanguage.googleapis.com",
+    curlBaseURL: "https://generativelanguage.googleapis.com/v1beta",
+    keyManagementURL: "https://makersuite.google.com/app/apikey",
+    testModel: ChatModels.GEMINI_FLASH,
+  },
+  [ChatModelProviders.ANTHROPIC]: {
+    label: "Anthropic",
+    host: "https://api.anthropic.com/",
+    curlBaseURL: "https://api.anthropic.com",
+    keyManagementURL: "https://console.anthropic.com/settings/keys",
+    testModel: ChatModels.CLAUDE_SONNET_4_6,
+  },
+  [ChatModelProviders.OPENAI]: {
+    label: "OpenAI",
+    host: "https://api.openai.com",
+    curlBaseURL: "https://api.openai.com/v1",
+    keyManagementURL: "https://platform.openai.com/api-keys",
+    testModel: ChatModels.GPT_5_5,
+  },
+  [ChatModelProviders.XAI]: {
+    label: "XAI",
+    host: "https://api.x.ai/v1",
+    curlBaseURL: "https://api.x.ai/v1",
+    keyManagementURL: "https://console.x.ai",
+    testModel: ChatModels.GROK_4_3,
+  },
+  [ChatModelProviders.GROQ]: {
+    label: "Groq",
+    host: "https://api.groq.com/openai",
+    curlBaseURL: "https://api.groq.com/openai/v1",
+    keyManagementURL: "https://console.groq.com/keys",
+    testModel: ChatModels.GROQ_LLAMA_8b,
+  },
+  [ChatModelProviders.COHEREAI]: {
+    label: "Cohere",
+    host: "https://api.cohere.ai/compatibility/v1",
+    curlBaseURL: "https://api.cohere.ai/compatibility/v1",
+    keyManagementURL: "https://dashboard.cohere.ai/api-keys",
+    testModel: ChatModels.COMMAND_R,
+  },
+  [ChatModelProviders.SILICONFLOW]: {
+    label: "SiliconFlow",
+    host: "https://api.siliconflow.com/v1",
+    curlBaseURL: "https://api.siliconflow.com/v1",
+    keyManagementURL: "https://cloud.siliconflow.com/me/account/ak",
+    testModel: ChatModels.SILICONFLOW_DEEPSEEK_V3,
+  },
+  [ChatModelProviders.OLLAMA]: {
+    label: "Ollama",
+    host: "http://localhost:11434/v1/",
+    curlBaseURL: "http://localhost:11434",
+    keyManagementURL: "",
+  },
+  [ChatModelProviders.LM_STUDIO]: {
+    label: "LM Studio",
+    host: "http://localhost:1234/v1",
+    curlBaseURL: "http://localhost:1234/v1",
+    keyManagementURL: "",
+  },
+  [ChatModelProviders.OPENAI_FORMAT]: {
+    label: "OpenAI Format",
+    host: "https://api.example.com/v1",
+    curlBaseURL: "https://api.example.com/v1",
+    keyManagementURL: "",
+  },
+  [ChatModelProviders.MISTRAL]: {
+    label: "Mistral",
+    host: "https://api.mistral.ai/v1",
+    curlBaseURL: "https://api.mistral.ai/v1",
+    keyManagementURL: "https://console.mistral.ai/api-keys",
+    testModel: ChatModels.MISTRAL_TINY,
+  },
+  [ChatModelProviders.DEEPSEEK]: {
+    label: "DeepSeek",
+    host: "https://api.deepseek.com/",
+    curlBaseURL: "https://api.deepseek.com",
+    keyManagementURL: "https://platform.deepseek.com/api-keys",
+    testModel: ChatModels.DEEPSEEK_CHAT,
+  },
+  [ChatModelProviders.COPILOT_PLUS]: {
+    label: "Copilot",
+    host: BREVILABS_MODELS_BASE_URL,
+    curlBaseURL: BREVILABS_MODELS_BASE_URL,
+    keyManagementURL: "",
+  },
+};
+
+// Map provider to its settings key for API key
+export const ProviderSettingsKeyMap: Record<SettingKeyProviders, keyof CopilotSettings> = {
+  anthropic: "anthropicApiKey",
+  openai: "openAIApiKey",
+  google: "googleApiKey",
+  groq: "groqApiKey",
+  openrouterai: "openRouterAiApiKey",
+  cohereai: "cohereApiKey",
+  xai: "xaiApiKey",
+  "copilot-plus": "plusLicenseKey",
+  mistralai: "mistralApiKey",
+  deepseek: "deepseekApiKey",
+  siliconflow: "siliconflowApiKey",
+};
+
+export enum DEFAULT_OPEN_AREA {
+  EDITOR = "editor",
+  VIEW = "view",
+}
+
+export enum SEND_SHORTCUT {
+  ENTER = "enter",
+  SHIFT_ENTER = "shift+enter",
+}
+
+export const COMMAND_IDS = {
+  TRIGGER_QUICK_COMMAND: "trigger-quick-command",
+  CLEAR_COPILOT_CACHE: "clear-copilot-cache",
+  COUNT_WORD_AND_TOKENS_SELECTION: "count-word-and-tokens-selection",
+  COUNT_TOTAL_VAULT_TOKENS: "count-total-vault-tokens",
+  DEBUG_WORD_COMPLETION: "debug-word-completion",
+  // Obsidian persists command ids in hotkey bindings and external integrations.
+  // The Miyo replacement keeps the legacy refresh id so upgrades retain them.
+  // https://github.com/Brevilabs/obsidian-copilot-private/issues/282
+  REFRESH_MIYO_INDEX: "index-vault-to-copilot-index",
+  LOAD_COPILOT_CHAT_CONVERSATION: "load-copilot-chat-conversation",
+  NEW_CHAT: "new-chat",
+  NEW_AGENT_CHAT: "new-agent-chat",
+  OPEN_COPILOT_CHAT_WINDOW: "chat-open-window",
+  OPEN_AGENT_CHAT_WINDOW: "agent-chat-open-window",
+  OPEN_RELEVANT_NOTES_VIEW: "open-relevant-notes-view",
+  TOGGLE_COPILOT_CHAT_WINDOW: "chat-toggle-window",
+  TOGGLE_AGENT_CHAT_WINDOW: "agent-chat-toggle-window",
+  ADD_SELECTION_TO_CHAT_CONTEXT: "add-selection-to-chat-context",
+  ADD_WEB_SELECTION_TO_CHAT_CONTEXT: "add-web-selection-to-chat-context",
+  ADD_CUSTOM_COMMAND: "add-custom-command",
+  APPLY_CUSTOM_COMMAND: "apply-custom-command",
+  OPEN_LOG_FILE: "open-log-file",
+  CLEAR_LOG_FILE: "clear-log-file",
+  DOWNLOAD_YOUTUBE_SCRIPT: "download-youtube-script",
+  // The wire id is persisted by Obsidian in hotkeys and command integrations.
+  PUBLISH_FILE_TO_OPENARTIFACTS: "publish-file-to-symposium",
+  TRIGGER_QUICK_ASK: "trigger-quick-ask",
+} as const;
+
+export const COMMAND_NAMES: Record<CommandId, string> = {
+  [COMMAND_IDS.TRIGGER_QUICK_COMMAND]: "Trigger quick command",
+  [COMMAND_IDS.CLEAR_COPILOT_CACHE]: "Clear Copilot cache",
+  [COMMAND_IDS.COUNT_TOTAL_VAULT_TOKENS]: "Count total tokens in your vault",
+  [COMMAND_IDS.COUNT_WORD_AND_TOKENS_SELECTION]: "Count words and tokens in selection",
+  [COMMAND_IDS.DEBUG_WORD_COMPLETION]: "Word completion: Debug",
+  [COMMAND_IDS.REFRESH_MIYO_INDEX]: "Refresh Miyo index",
+  [COMMAND_IDS.LOAD_COPILOT_CHAT_CONVERSATION]: "Load Copilot chat conversation",
+  [COMMAND_IDS.NEW_CHAT]: "New Copilot Quick Chat",
+  [COMMAND_IDS.NEW_AGENT_CHAT]: "New Copilot Agent Chat",
+  [COMMAND_IDS.OPEN_COPILOT_CHAT_WINDOW]: "Open Copilot Chat Window",
+  [COMMAND_IDS.OPEN_AGENT_CHAT_WINDOW]: "Open Copilot Agent Chat Window",
+  [COMMAND_IDS.OPEN_RELEVANT_NOTES_VIEW]: "Open Relevant Notes",
+  [COMMAND_IDS.TOGGLE_COPILOT_CHAT_WINDOW]: "Toggle Copilot Chat Window",
+  [COMMAND_IDS.TOGGLE_AGENT_CHAT_WINDOW]: "Toggle Copilot Agent Chat Window",
+  [COMMAND_IDS.ADD_SELECTION_TO_CHAT_CONTEXT]: "Add selection to chat context",
+  [COMMAND_IDS.ADD_WEB_SELECTION_TO_CHAT_CONTEXT]: "Add web selection to chat context",
+  [COMMAND_IDS.ADD_CUSTOM_COMMAND]: "Add new custom command",
+  [COMMAND_IDS.APPLY_CUSTOM_COMMAND]: "Apply custom command",
+  [COMMAND_IDS.OPEN_LOG_FILE]: "Create log file",
+  [COMMAND_IDS.CLEAR_LOG_FILE]: "Clear log file",
+  [COMMAND_IDS.DOWNLOAD_YOUTUBE_SCRIPT]: "Download YouTube Script (plus)",
+  [COMMAND_IDS.PUBLISH_FILE_TO_OPENARTIFACTS]: "Publish file to OpenArtifacts",
+  [COMMAND_IDS.TRIGGER_QUICK_ASK]: "Quick Ask",
+};
+
+export type CommandId = (typeof COMMAND_IDS)[keyof typeof COMMAND_IDS];
+
+/**
+ * Icons for commands displayed in the mobile toolbar.
+ * Uses Lucide icon names supported by Obsidian.
+ */
+export const COMMAND_ICONS: Partial<Record<CommandId, string>> = {
+  [COMMAND_IDS.NEW_CHAT]: "message-square-plus",
+  [COMMAND_IDS.NEW_AGENT_CHAT]: COPILOT_AGENT_ICON_ID,
+  [COMMAND_IDS.OPEN_COPILOT_CHAT_WINDOW]: "message-square",
+  [COMMAND_IDS.OPEN_AGENT_CHAT_WINDOW]: COPILOT_AGENT_ICON_ID,
+  [COMMAND_IDS.OPEN_RELEVANT_NOTES_VIEW]: "files",
+  [COMMAND_IDS.TOGGLE_COPILOT_CHAT_WINDOW]: "message-square",
+  [COMMAND_IDS.TOGGLE_AGENT_CHAT_WINDOW]: COPILOT_AGENT_ICON_ID,
+  [COMMAND_IDS.LOAD_COPILOT_CHAT_CONVERSATION]: "history",
+  [COMMAND_IDS.TRIGGER_QUICK_COMMAND]: "terminal-square",
+  [COMMAND_IDS.TRIGGER_QUICK_ASK]: "sparkles",
+  [COMMAND_IDS.ADD_SELECTION_TO_CHAT_CONTEXT]: "text-cursor-input",
+  [COMMAND_IDS.ADD_WEB_SELECTION_TO_CHAT_CONTEXT]: "globe",
+  [COMMAND_IDS.ADD_CUSTOM_COMMAND]: "plus-circle",
+  [COMMAND_IDS.APPLY_CUSTOM_COMMAND]: "play-circle",
+  [COMMAND_IDS.REFRESH_MIYO_INDEX]: "refresh-cw",
+  [COMMAND_IDS.CLEAR_COPILOT_CACHE]: "eraser",
+  [COMMAND_IDS.COUNT_TOTAL_VAULT_TOKENS]: "calculator",
+  [COMMAND_IDS.COUNT_WORD_AND_TOKENS_SELECTION]: "hash",
+  [COMMAND_IDS.OPEN_LOG_FILE]: "file-text",
+  [COMMAND_IDS.CLEAR_LOG_FILE]: "file-x",
+  [COMMAND_IDS.DOWNLOAD_YOUTUBE_SCRIPT]: "youtube",
+  [COMMAND_IDS.PUBLISH_FILE_TO_OPENARTIFACTS]: "share-2",
+};
+
+/**
+ * Text-readable file extensions that all chains can process without Plus mode.
+ * These files can be read directly via `vault.read()` and don't require special parsers.
+ * Add new text-based extensions here to enable them everywhere (active note, context, chain).
+ */
+export const TEXT_READABLE_EXTENSIONS = ["md", "canvas", "base"];
+
+/**
+ * Valid file extensions for note context.
+ * Includes text-readable files plus Plus-only formats like PDF.
+ * This does NOT include images - images are handled separately in the UI.
+ */
+export const ALLOWED_NOTE_CONTEXT_EXTENSIONS = [...TEXT_READABLE_EXTENSIONS, "pdf"];
+
+export const RESTRICTION_MESSAGES = {
+  NON_MARKDOWN_FILES_RESTRICTED:
+    "Non-markdown files are only available in Copilot Plus mode. Please upgrade to access this file type.",
+  URL_PROCESSING_RESTRICTED:
+    "URL processing is only available in Copilot Plus mode. URLs will not be processed for context.",
+  UNSUPPORTED_FILE_TYPE: (extension: string) =>
+    `${extension.toUpperCase()} files are not supported in the current mode.`,
+} as const;
+
+export const OPENCODE_RELEASE_URL_TEMPLATE =
+  "https://github.com/sst/opencode/releases/download/v{version}/{asset}";
+export const OPENCODE_RELEASE_API_URL_TEMPLATE =
+  "https://api.github.com/repos/sst/opencode/releases/tags/v{version}";
 
 export const DEFAULT_SETTINGS: CopilotSettings = {
+  userId: uuidv4(),
+  isPaidUser: false,
+  isPlusUser: false,
+  entitlementToken: "",
+  entitlementExpiresAt: 0,
+  plusLicenseKey: "",
   openAIApiKey: "",
   openAIOrgId: "",
   huggingfaceApiKey: "",
   cohereApiKey: "",
   anthropicApiKey: "",
-  anthropicModel: "claude-3-sonnet-20240229",
-  azureOpenAIApiKey: "",
-  azureOpenAIApiInstanceName: "",
-  azureOpenAIApiDeploymentName: "",
-  azureOpenAIApiVersion: "",
-  azureOpenAIApiEmbeddingDeploymentName: "",
   googleApiKey: "",
   openRouterAiApiKey: "",
-  openRouterModel: "cognitivecomputations/dolphin-mixtral-8x7b",
-  defaultModel: ChatModels.GPT_4_TURBO,
-  defaultModelDisplayName: ChatModelDisplayNames.GPT_4_TURBO,
-  embeddingModel: EmbeddingModels.OPENAI_EMBEDDING_SMALL,
-  temperature: 0.1,
-  maxTokens: 1000,
+  xaiApiKey: "",
+  mistralApiKey: "",
+  deepseekApiKey: "",
+  siliconflowApiKey: "",
+  defaultChainType: ChainType.LLM_CHAIN,
+  defaultModelKey: ChatModels.OPENROUTER_GEMINI_2_5_FLASH + "|" + ChatModelProviders.OPENROUTERAI,
   contextTurns: 15,
   userSystemPrompt: "",
   openAIProxyBaseUrl: "",
-  openAIProxyModelName: "",
-  openAIEmbeddingProxyBaseUrl: "",
-  openAIEmbeddingProxyModelName: "",
-  ollamaModel: "llama2",
-  ollamaBaseUrl: "",
-  lmStudioBaseUrl: "http://localhost:1234/v1",
   stream: true,
-  defaultSaveFolder: "copilot-conversations",
-  indexVaultToVectorStore: VAULT_VECTOR_STORE_STRATEGY.NEVER,
-  qaExclusionPaths: "",
+  copilotFolder: DEFAULT_COPILOT_FOLDER,
+  // Every folder ever activated as the Copilot root (seeded with the legacy
+  // root in the v8 migration). Kept append-only so each historical root stays
+  // permanently excluded from QA indexing even after the root is changed.
+  copilotRootHistory: [],
+  // True only when a legacy (v1-v7) vault was migrated to v8; WS-D reads it to
+  // decide whether to show the one-time folder-relocation prompt, then clears it.
+  upgradedToV8FromLegacy: false,
+  defaultSaveFolder: DEFAULT_CHAT_HISTORY_FOLDER,
+  defaultConversationTag: "copilot-conversation",
+  autosaveChat: true,
+  autoAddActiveContentToContext: true,
+  defaultOpenArea: DEFAULT_OPEN_AREA.VIEW,
+  defaultSendShortcut: SEND_SHORTCUT.ENTER,
+  customPromptsFolder: DEFAULT_CUSTOM_PROMPTS_FOLDER,
+  qaExclusions: DEFAULT_QA_EXCLUSIONS_SETTING,
+  qaInclusions: "",
   chatNoteContextPath: "",
   chatNoteContextTags: [],
   debug: false,
-  enableEncryption: false,
-  maxSourceChunks: 3,
-  groqModel: "llama3-70b-8192",
+  maxSourceChunks: DEFAULT_MAX_SOURCE_CHUNKS,
+  enableInlineCitations: true,
   groqApiKey: "",
+  activeModels: BUILTIN_CHAT_MODELS,
+  lexicalSearchRamLimit: 100, // Default 100 MB
+  promptUsageTimestamps: {},
+  promptSortStrategy: PromptSortStrategy.TIMESTAMP,
+  chatHistorySortStrategy: "recent",
+  projectsFolder: DEFAULT_PROJECTS_FOLDER,
+  defaultConversationNoteName: "{$topic}@{$date}_{$time}",
+  /** @deprecated */
+  inlineEditCommands: [],
+  projectList: [],
+  lastDismissedVersion: null,
+  lastShownStartupVersion: null,
+  passMarkdownImages: true,
+  enableAutonomousAgent: true,
+  enableCustomPromptTemplating: true,
+  enableSelfHostMode: false,
+  enableMiyo: false,
+  enableMiyoSearchSkill: false,
+  miyoSearchAll: false,
+  relevantNotesLiveUpdate: true,
+  miyoServerUrl: "",
+  selfHostSearchProvider: "firecrawl",
+  firecrawlApiKey: "",
+  perplexityApiKey: "",
+  parallelApiKey: "",
+  exaApiKey: "",
+  supadataApiKey: "",
+  docProcessorBackend: "plus",
+  enableLexicalBoosts: true,
+  suggestedDefaultCommands: false,
+  autonomousAgentEnabledToolIds: [
+    "localSearch",
+    "readNote",
+    "webSearch",
+    "pomodoro",
+    "youtubeTranscription",
+    "writeFile",
+    "editFile",
+    "updateMemory",
+  ],
+  reasoningEffort: DEFAULT_MODEL_SETTING.REASONING_EFFORT,
+  verbosity: DEFAULT_MODEL_SETTING.VERBOSITY,
+  memoryFolderName: DEFAULT_MEMORY_FOLDER,
+  enableRecentConversations: true,
+  maxRecentConversations: 30,
+  enableSavedMemory: true,
+  quickCommandModelKey: undefined,
+  quickCommandIncludeNoteContext: true,
+  autoAcceptEdits: false,
+  diffViewMode: "split",
+  userSystemPromptsFolder: DEFAULT_SYSTEM_PROMPTS_FOLDER,
+  defaultSystemPromptTitle: "",
+  autoCompactThreshold: 128000,
+  convertedDocOutputFolder: DEFAULT_CONVERTED_DOC_OUTPUT_FOLDER,
+  agentMode: {
+    byok: {},
+    activeBackend: "opencode",
+    backends: {},
+    // On by default so the diagnostic frame log is already capturing when a
+    // user hits a bug and clicks "Report an issue" (it can't capture
+    // retroactively). The migration in src/settings/model.ts preserves an
+    // explicit prior choice, so anyone who turned it off stays off. The privacy
+    // disclosure lives in the Report-issue modal, shown only when the user
+    // chooses to share the log.
+    debugFullFrames: true,
+    // On by default: an agent turn can run for minutes, and the chime is the
+    // only thing that reaches a user who has looked away. Turned off in
+    // Basic → Agents.
+    notificationSound: true,
+    // Named rather than imported from the sound catalog: `@/logger` pulls in
+    // `@/settings/model`, so importing the catalog here would make this module
+    // load before its own DEFAULT_SETTINGS exists. The literal is still
+    // checked, since the field is typed to the catalog's ids.
+    notificationSoundId: "piano",
+    welcomeDismissed: false,
+    skills: {
+      folder: DEFAULT_SKILLS_FOLDER,
+    },
+  },
+  providers: {},
+  configuredModels: [],
+  backends: {},
 };
+
+export const EVENT_NAMES = {
+  CHAT_IS_VISIBLE: "chat-is-visible",
+  ACTIVE_LEAF_CHANGE: "active-leaf-change",
+  ABORT_STREAM: "abort-stream",
+  INSERT_TEXT_TO_CHAT: "insert-text-to-chat",
+};
+
+export enum ABORT_REASON {
+  USER_STOPPED = "user-stopped",
+  NEW_CHAT = "new-chat",
+  UNMOUNT = "component-unmount",
+}

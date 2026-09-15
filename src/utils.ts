@@ -1,54 +1,110 @@
-import { ChainType, Document } from "@/chainFactory";
-import {
-  DEFAULT_SETTINGS,
-  DISPLAY_NAME_TO_MODEL,
-  NOMIC_EMBED_TEXT,
-  USER_SENDER,
-} from "@/constants";
-import { CopilotSettings } from "@/settings/SettingsPage";
-import { ChatMessage } from "@/sharedState";
-import { MemoryVariables } from "@langchain/core/memory";
-import { RunnableSequence } from "@langchain/core/runnables";
-import { BaseChain, RetrievalQAChain } from "langchain/chains";
-import moment from "moment";
-import { TFile, Vault, parseYaml } from "obsidian";
+import { compareSemver } from "@/utils/semver";
+// Reason: `buffer` is the npm polyfill (browser-compatible), bundled by esbuild
+// so the same Buffer code path works on desktop (Electron) and mobile (WebView).
+import { Buffer } from "buffer/";
 
-export const isFolderMatch = (
-  fileFullpath: string,
-  inputPath: string,
-): boolean => {
-  const fileSegments = fileFullpath
-    .split("/")
-    .map((segment) => segment.toLowerCase());
+import { ChainType } from "@/chainType";
+import {
+  ALLOWED_NOTE_CONTEXT_EXTENSIONS,
+  ModelCapability,
+  TEXT_READABLE_EXTENSIONS,
+} from "@/constants";
+import { logInfo, logWarn } from "@/logger";
+import { formatUsageCapError } from "@/utils/usageCapError";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { MemoryVariables } from "@langchain/core/memory";
+import { DateTime } from "luxon";
+import { App, MarkdownView, Notice, TFile, Vault, normalizePath, requestUrl } from "obsidian";
+import { CustomModel } from "./aiParams";
+export { checkModelApiKey, err2String, getProviderLabel } from "@/lib/model-display-utils";
+
+/**
+ * Unified type for fetch implementation.
+ * Used for dependency injection of fetch (e.g., safeFetch for CORS bypass).
+ */
+export type FetchImplementation = (url: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * Extract domain from URL, removing 'www.' prefix.
+ * Returns the original URL string if parsing fails.
+ * @param url - The URL to extract domain from
+ * @returns Domain without 'www.' prefix, or original string on parse failure
+ */
+export function getDomainFromUrl(url: string): string {
+  try {
+    const urlObj = new URL(url);
+    return urlObj.hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+// Add custom error type at the top of the file
+interface APIError extends Error {
+  json?: unknown;
+}
+
+// Error message constants
+const ERROR_MESSAGES = {
+  INVALID_LICENSE_KEY_USER:
+    "Invalid Copilot Plus license key. Please check your license key in settings.",
+  UNKNOWN_ERROR: "An unknown error occurred",
+  REQUEST_FAILED: (status: number) => `Request failed, status ${status}`,
+} as const;
+
+// Error handling utilities
+interface ErrorDetail {
+  status?: number;
+  message?: string;
+  reason?: string;
+}
+
+function extractErrorDetail(error: unknown): ErrorDetail {
+  const err = error as Record<string, unknown> | null | undefined;
+  const errorDetail: ErrorDetail = (err?.detail as ErrorDetail) || {};
+  return {
+    status: errorDetail.status,
+    message: errorDetail.message || (err?.message as string | undefined),
+    reason: errorDetail.reason,
+  };
+}
+
+function isLicenseKeyError(error: unknown): boolean {
+  const errorDetail = extractErrorDetail(error);
+  const err = error as Record<string, unknown> | null | undefined;
+  const message = err?.message as string | undefined;
+  return Boolean(
+    errorDetail.reason === "Invalid license key" ||
+    message === "Invalid license key" ||
+    message?.includes("status 403") ||
+    errorDetail.status === 403
+  );
+}
+
+export function getApiErrorMessage(error: unknown): string {
+  if (isLicenseKeyError(error)) {
+    return ERROR_MESSAGES.INVALID_LICENSE_KEY_USER;
+  }
+  // Usage-cap (plan limit) errors get a friendly, actionable message with a link to
+  // the usage dashboard to purchase credits, instead of the raw relay error text.
+  const capMessage = formatUsageCapError(error);
+  if (capMessage) {
+    return capMessage;
+  }
+  const errorDetail = extractErrorDetail(error);
+  return (
+    errorDetail.message ||
+    (errorDetail.reason ? `Error: ${errorDetail.reason}` : ERROR_MESSAGES.UNKNOWN_ERROR)
+  );
+}
+
+export const isFolderMatch = (fileFullpath: string, inputPath: string): boolean => {
+  const fileSegments = fileFullpath.split("/").map((segment) => segment.toLowerCase());
   return fileSegments.includes(inputPath.toLowerCase());
 };
 
-export async function getNoteFileFromTitle(
-  vault: Vault,
-  noteTitle: string,
-): Promise<TFile | null> {
-  // Get all markdown files in the vault
-  const files = vault.getMarkdownFiles();
-
-  // Iterate through all files to find a match by title
-  for (const file of files) {
-    // Extract the title from the filename by removing the extension
-    const title = file.basename;
-
-    if (title === noteTitle) {
-      // If a match is found, return the file path
-      return file;
-    }
-  }
-
-  // If no match is found, return null
-  return null;
-}
-
-export const getNotesFromPath = async (
-  vault: Vault,
-  path: string,
-): Promise<TFile[]> => {
+/** TODO: Rewrite with app.vault.getAbstractFileByPath() */
+export const getNotesFromPath = (vault: Vault, path: string): TFile[] => {
   const files = vault.getMarkdownFiles();
 
   // Special handling for the root path '/'
@@ -56,65 +112,198 @@ export const getNotesFromPath = async (
     return files;
   }
 
-  // Split the path to get the last folder name
-  const pathSegments = path.split("/");
-  const lastSegment = pathSegments[pathSegments.length - 1].toLowerCase();
+  // Normalize the input path
+  const normalizedPath = path.toLowerCase().replace(/^\/|\/$/g, "");
 
   return files.filter((file) => {
-    // Split the file path and get the last directory name
-    return (
-      isFolderMatch(file.path, lastSegment) || file.basename === lastSegment
-    );
+    // Normalize the file path
+    const normalizedFilePath = file.path.toLowerCase();
+    const filePathParts = normalizedFilePath.split("/");
+    const pathParts = normalizedPath.split("/");
+
+    // Check if the file path contains all parts of the input path in order
+    let filePathIndex = 0;
+    for (const pathPart of pathParts) {
+      while (filePathIndex < filePathParts.length) {
+        if (filePathParts[filePathIndex] === pathPart) {
+          break;
+        }
+        filePathIndex++;
+      }
+      if (filePathIndex >= filePathParts.length) {
+        return false;
+      }
+    }
+
+    return true;
   });
 };
 
-export async function getTagsFromNote(
-  file: TFile,
-  vault: Vault,
-): Promise<string[]> {
-  const fileContent = await vault.cachedRead(file);
-  // Check if the file starts with frontmatter delimiter
-  if (fileContent.startsWith("---")) {
-    const frontMatterBlock = fileContent.split("---", 3);
-    // Ensure there's a closing delimiter for frontmatter
-    if (frontMatterBlock.length >= 3) {
-      const frontMatterContent = frontMatterBlock[1];
-      try {
-        const frontMatter = parseYaml(frontMatterContent) || {};
-        const tags = frontMatter.tags || [];
-        // Strip any '#' from the frontmatter tags. Obsidian sometimes has '#' sometimes doesn't...
-        return tags
-          .map((tag: string) => tag.replace("#", ""))
-          .map((tag: string) => tag.toLowerCase());
-      } catch (error) {
-        console.error("Error parsing YAML frontmatter:", error);
-        return [];
-      }
-    }
-  }
-  return [];
+/**
+ * @param tag - The tag to strip the hash symbol from.
+ * @returns The tag without the hash symbol.
+ */
+export function stripHash(tag: string): string {
+  return tag.replace(/^#/, "").trim();
 }
 
-export async function getNotesFromTags(
-  vault: Vault,
-  tags: string[],
-  noteFiles?: TFile[],
-): Promise<TFile[]> {
+/**
+ * Options for {@link stripFrontmatter}.
+ */
+interface StripFrontmatterOptions {
+  /**
+   * When true (default), trims leading whitespace after the frontmatter block.
+   * When false, preserves leading whitespace from the body, but still removes
+   * the single newline that immediately follows the closing frontmatter marker.
+   */
+  trimStart?: boolean;
+}
+
+/**
+ * Strip YAML frontmatter from markdown content.
+ * @param content - The markdown content to strip frontmatter from.
+ * @param options - Options controlling how leading whitespace is handled.
+ * @returns The content without the frontmatter block.
+ */
+export function stripFrontmatter(content: string, options: StripFrontmatterOptions = {}): string {
+  const { trimStart = true } = options;
+
+  if (content.startsWith("---")) {
+    const end = content.indexOf("---", 3);
+    if (end !== -1) {
+      const body = content.slice(end + 3);
+
+      if (trimStart) {
+        return body.trimStart();
+      }
+
+      // Preserve body whitespace, but remove the frontmatter/body separator newline.
+      if (body.startsWith("\r\n")) {
+        return body.slice(2);
+      }
+      if (body.startsWith("\n") || body.startsWith("\r")) {
+        return body.slice(1);
+      }
+      return body;
+    }
+  }
+  return content;
+}
+
+/**
+ * @param app - The Obsidian app instance.
+ * @param file - The note file to get tags from.
+ * @param frontmatterOnly - Whether to only get tags from frontmatter.
+ * @returns An array of lowercase tags without the hash symbol.
+ */
+export function getTagsFromNote(app: App, file: TFile, frontmatterOnly = true): string[] {
+  const metadata = app.metadataCache.getFileCache(file);
+  const frontmatterTags = metadata?.frontmatter?.tags;
+  const allTags = new Set<string>();
+
+  if (!frontmatterOnly) {
+    const inlineTags = metadata?.tags?.map((tag) => tag.tag);
+    if (inlineTags) {
+      inlineTags.forEach((tag) => allTags.add(stripHash(tag)));
+    }
+  }
+
+  // Add frontmatter tags
+  if (frontmatterTags) {
+    if (Array.isArray(frontmatterTags)) {
+      frontmatterTags.forEach((tag) => {
+        if (typeof tag === "string") {
+          allTags.add(stripHash(tag));
+        }
+      });
+    } else if (typeof frontmatterTags === "string") {
+      allTags.add(stripHash(frontmatterTags));
+    }
+  }
+
+  return Array.from(allTags);
+}
+
+/** Canonical empty array for property values, frozen for referential stability. */
+const EMPTY_PROPERTY_VALUES = Object.freeze([]) as unknown as string[];
+
+/**
+ * Read the values of a single frontmatter property from a note. Backs the
+ * Project "Property" context source, which includes notes by a user-defined
+ * frontmatter field (e.g. `Topics: Physics`) rather than by tag — the taxonomy
+ * some vaults use in place of tags, which forbid spaces and slugs.
+ *
+ * @param app - The Obsidian app instance.
+ * @param file - The note whose frontmatter is read.
+ * @param key - The frontmatter property name to read.
+ * @returns The property's values as strings: each element for a list property,
+ * a single element for a scalar, and an empty array when the key is absent.
+ */
+export function getPropertyValuesFromNote(app: App, file: TFile, key: string): string[] {
+  const frontmatter = app.metadataCache.getFileCache(file)?.frontmatter;
+  // Reason: `hasOwnProperty` (not `in`) so an absent key never reads an inherited
+  // member — e.g. `key: "constructor"` on a note without it would otherwise
+  // surface the prototype's function value.
+  if (!frontmatter || !Object.hasOwn(frontmatter, key)) {
+    return EMPTY_PROPERTY_VALUES;
+  }
+  const raw = (frontmatter as Record<string, unknown>)[key];
+  // Reason: only scalars round-trip through the `[key:value]` grammar. An object
+  // value would collapse to "[object Object]" (many distinct maps → one indistinct
+  // value), so drop non-scalars here rather than match on an ambiguous string.
+  const values: unknown[] = Array.isArray(raw) ? (raw as unknown[]) : [raw];
+  const scalars = values.filter(isScalarPropertyValue);
+  if (scalars.length === 0) {
+    return EMPTY_PROPERTY_VALUES;
+  }
+  return scalars.map((value) => String(value));
+}
+
+/** Whether a frontmatter value is a scalar that the `[key:value]` grammar can represent. */
+function isScalarPropertyValue(value: unknown): value is string | number | boolean {
+  const type = typeof value;
+  return type === "string" || type === "number" || type === "boolean";
+}
+
+/**
+ * Whether a note declares a frontmatter property, regardless of its value.
+ * Backs the key-only Project property source (`[key:]`): a note with an empty
+ * or null-valued key (e.g. `Topics:` or `Topics: []`) still has the key and so
+ * must match, which a values-length check would miss.
+ *
+ * @param app - The Obsidian app instance.
+ * @param file - The note whose frontmatter is inspected.
+ * @param key - The frontmatter property name to look for.
+ * @returns True when the note's frontmatter contains the key.
+ */
+export function noteHasProperty(app: App, file: TFile, key: string): boolean {
+  const frontmatter: Record<string, unknown> | undefined =
+    app.metadataCache.getFileCache(file)?.frontmatter;
+  // Reason: `hasOwnProperty` (not `in`) so `[constructor:]` / `[toString:]` match
+  // only notes that actually declare that key, not every note whose frontmatter
+  // inherits it from Object.prototype.
+  return frontmatter != null && Object.hasOwn(frontmatter, key);
+}
+
+/**
+ * Get notes from tags.
+ * @param app - The Obsidian app instance.
+ * @param tags - The tags to get notes from. Tags should be with the hash symbol.
+ * @param noteFiles - The notes to get notes from.
+ * @returns An array of note files.
+ */
+export function getNotesFromTags(app: App, tags: string[], noteFiles?: TFile[]): TFile[] {
   if (tags.length === 0) {
     return [];
   }
 
-  // Strip any '#' from the tags set from the user
-  tags = tags.map((tag) => tag.replace("#", ""));
+  tags = tags.map((tag) => stripHash(tag));
 
-  const files =
-    noteFiles && noteFiles.length > 0
-      ? noteFiles
-      : await getNotesFromPath(vault, "/");
+  const files = noteFiles && noteFiles.length > 0 ? noteFiles : getNotesFromPath(app.vault, "/");
   const filesWithTag = [];
 
   for (const file of files) {
-    const noteTags = await getTagsFromNote(file, vault);
+    const noteTags = getTagsFromNote(app, file);
     if (tags.some((tag) => noteTags.includes(tag))) {
       filesWithTag.push(file);
     }
@@ -123,396 +312,244 @@ export async function getNotesFromTags(
   return filesWithTag;
 }
 
-export function isPathInList(filePath: string, pathList: string): boolean {
-  if (!pathList) return false;
-
-  // Extract the file name from the filePath
-  const fileName = filePath.split("/").pop()?.toLowerCase();
-
-  // Normalize the file path for case-insensitive comparison
-  const normalizedFilePath = filePath.toLowerCase();
-
-  return pathList
-    .split(",")
-    .map(
-      (path) =>
-        path
-          .trim() // Trim whitespace
-          .replace(/^\[\[|\]\]$/g, "") // Remove surrounding [[ and ]]
-          .replace(/^\//, "") // Remove leading slash
-          .toLowerCase(), // Convert to lowercase for case-insensitive comparison
-    )
-    .some((normalizedPath) => {
-      // Check for exact match or proper segmentation
-      const isExactMatch =
-        normalizedFilePath === normalizedPath ||
-        normalizedFilePath.startsWith(normalizedPath + "/") ||
-        normalizedFilePath.endsWith("/" + normalizedPath) ||
-        normalizedFilePath.includes("/" + normalizedPath + "/");
-      // Check for file name match (for cases like [[note1]])
-      const isFileNameMatch = fileName === normalizedPath + ".md";
-
-      return isExactMatch || isFileNameMatch;
-    });
+export interface FormattedDateTime {
+  fileName: string;
+  display: string;
+  epoch: number;
 }
-
-export const stringToChainType = (chain: string): ChainType => {
-  switch (chain) {
-    case "llm_chain":
-      return ChainType.LLM_CHAIN;
-    case "long_note_qa":
-      return ChainType.LONG_NOTE_QA_CHAIN;
-    case "vault_qa":
-      return ChainType.VAULT_QA_CHAIN;
-    default:
-      throw new Error(`Unknown chain type: ${chain}`);
-  }
-};
-
-export const isLLMChain = (
-  chain: RunnableSequence,
-): chain is RunnableSequence => {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (chain as any).last.bound.modelName || (chain as any).last.bound.model;
-};
-
-export const isRetrievalQAChain = (
-  chain: BaseChain,
-): chain is RetrievalQAChain => {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (chain as any).last.bound.retriever !== undefined;
-};
-
-export const isSupportedChain = (
-  chain: RunnableSequence,
-): chain is RunnableSequence => {
-  return isLLMChain(chain) || isRetrievalQAChain(chain);
-};
-
-export const getModelName = (modelDisplayName: string): string => {
-  return DISPLAY_NAME_TO_MODEL[modelDisplayName];
-};
-
-// Returns the last N messages from the chat history,
-// last one being the newest ai message
-export const getChatContext = (
-  chatHistory: ChatMessage[],
-  contextSize: number,
-) => {
-  if (chatHistory.length === 0) {
-    return [];
-  }
-  const lastAiMessageIndex = chatHistory
-    .slice()
-    .reverse()
-    .findIndex((msg) => msg.sender !== USER_SENDER);
-  if (lastAiMessageIndex === -1) {
-    // No ai messages found, return an empty array
-    return [];
-  }
-
-  const lastIndex = chatHistory.length - 1 - lastAiMessageIndex;
-  const startIndex = Math.max(0, lastIndex - contextSize + 1);
-  return chatHistory.slice(startIndex, lastIndex + 1);
-};
 
 export const formatDateTime = (
   now: Date,
-  timezone: "local" | "utc" = "local",
-) => {
-  const formattedDateTime = moment(now);
+  timezone: "local" | "utc" = "local"
+): FormattedDateTime => {
+  const dt = timezone === "utc" ? DateTime.fromJSDate(now).toUTC() : DateTime.fromJSDate(now);
 
-  if (timezone === "utc") {
-    formattedDateTime.utc();
-  }
-
-  return formattedDateTime.format("YYYY_MM_DD-HH_mm_ss");
+  return {
+    fileName: dt.toFormat("yyyyMMdd_HHmmss"),
+    display: dt.toFormat("yyyy/MM/dd HH:mm:ss"),
+    epoch: dt.toMillis(),
+  };
 };
 
-export async function getFileContent(
-  file: TFile,
-  vault: Vault,
-): Promise<string | null> {
-  if (file.extension != "md") return null;
-  return await vault.cachedRead(file);
+/**
+ * Ensure a folder path exists by creating any missing parent directories.
+ * Works across desktop and mobile. Safe to call repeatedly.
+ *
+ * Examples:
+ * - ensureFolderExists("copilot/copilot-conversations")
+ * - ensureFolderExists("some/deep/nested/path")
+ *
+ * Throws if any segment conflicts with an existing file.
+ */
+export async function ensureFolderExists(vault: Vault, folderPath: string): Promise<void> {
+  const path = normalizePath(folderPath).replace(/^\/+/, "").replace(/\/+$/, "");
+  if (!path) return; // nothing to ensure
+
+  const parts = path.split("/").filter(Boolean);
+  let current = "";
+
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+
+    const existing = vault.getAbstractFileByPath(current);
+    if (existing) {
+      if (existing instanceof TFile) {
+        throw new Error(`Path conflict: "${current}" exists as a file, expected folder.`);
+      }
+      // If it's a folder, continue to check/create the next segment
+      continue;
+    }
+
+    // Create this level; parents are guaranteed to exist from previous iterations
+    await vault.adapter.mkdir(current);
+  }
+}
+
+/**
+ * Check if a file has a text-readable extension (md, canvas, base).
+ */
+export function isTextReadableFile(file: TFile | null): boolean {
+  if (!file) return false;
+  return TEXT_READABLE_EXTENSIONS.includes(file.extension);
+}
+
+export async function getFileContent(file: TFile, vault: Vault): Promise<string | null> {
+  if (!isTextReadableFile(file)) return null;
+  return await vault.read(file);
 }
 
 export function getFileName(file: TFile): string {
   return file.basename;
 }
 
-export async function getAllNotesContent(vault: Vault): Promise<string> {
-  let allContent = "";
-
-  const markdownFiles = vault.getMarkdownFiles();
-
-  for (const file of markdownFiles) {
-    const fileContent = await vault.cachedRead(file);
-    allContent += fileContent + " ";
-  }
-
-  return allContent;
+/**
+ * Check if a file is allowed for note context (text-readable files plus PDF).
+ * This does NOT include images - images are handled separately in the UI.
+ * @param file The file to check
+ * @returns true if the file is allowed for note context, false otherwise
+ */
+export function isAllowedFileForNoteContext(file: TFile | null): boolean {
+  if (!file) return false;
+  return ALLOWED_NOTE_CONTEXT_EXTENSIONS.includes(file.extension);
 }
 
-export function areEmbeddingModelsSame(
-  model1: string | undefined,
-  model2: string | undefined,
-): boolean {
-  if (!model1 || !model2) return false;
-  // TODO: Hacks to handle different embedding model names for the same model. Need better handling.
-  if (model1.includes(NOMIC_EMBED_TEXT) && model2.includes(NOMIC_EMBED_TEXT)) {
+/**
+ * Checks if a chain type is a Plus mode chain.
+ * Plus mode chains have access to premium features like PDF processing and URL processing.
+ * @param chainType The chain type to check
+ * @returns true if this is a Plus mode chain, false otherwise
+ */
+export function isPlusChain(chainType: ChainType): boolean {
+  return chainType === ChainType.COPILOT_PLUS_CHAIN;
+}
+
+/**
+ * Checks if a file extension is allowed for context based on the chain type.
+ * All chains support text-readable files (md, canvas, base).
+ * Plus chains additionally support PDF, EPUB, PPT, DOCX, etc.
+ * @param file The file to check
+ * @param chainType The current chain type
+ * @returns true if the file is allowed for this chain type, false otherwise
+ */
+export function isAllowedFileForChainContext(file: TFile | null, chainType: ChainType): boolean {
+  if (!file) return false;
+
+  if (isTextReadableFile(file)) {
     return true;
   }
-  if (
-    (model1 === "small" && model2 === "cohereai") ||
-    (model1 === "cohereai" && model2 === "small")
-  ) {
-    return true;
-  }
-  return model1 === model2;
+
+  // Plus chains support all other file types (PDF, EPUB, PPT, DOCX, etc.)
+  return isPlusChain(chainType);
 }
 
-export function sanitizeSettings(settings: CopilotSettings): CopilotSettings {
-  const sanitizedSettings: CopilotSettings = { ...settings };
-
-  // Stuff in settings are string even when the interface has number type!
-  const temperature = Number(settings.temperature);
-  sanitizedSettings.temperature = isNaN(temperature)
-    ? DEFAULT_SETTINGS.temperature
-    : temperature;
-
-  const maxTokens = Number(settings.maxTokens);
-  sanitizedSettings.maxTokens = isNaN(maxTokens)
-    ? DEFAULT_SETTINGS.maxTokens
-    : maxTokens;
-
-  const contextTurns = Number(settings.contextTurns);
-  sanitizedSettings.contextTurns = isNaN(contextTurns)
-    ? DEFAULT_SETTINGS.contextTurns
-    : contextTurns;
-
-  return sanitizedSettings;
-}
-
-// Basic prompts
-// Note that GPT4 is much better at following instructions than GPT3.5!
-export function sendNoteContentPrompt(
-  noteName: string,
-  noteContent: string | null,
-): string {
-  return (
-    `Please read the note below and be ready to answer questions about it. ` +
-    `If there's no information about a certain topic, just say the note ` +
-    `does not mention it. ` +
-    `The content of the note is between "/***/":\n\n/***/\n\n${noteContent}\n\n/***/\n\n` +
-    `Please reply with the following word for word:` +
-    `"OK I've read this note titled [[ ${noteName} ]]. ` +
-    `Feel free to ask related questions, such as 'give me a summary of this note in bullet points', 'what key questions does it answer', etc. "\n`
-  );
-}
-
-export function sendNotesContentPrompt(
-  notes: { name: string; content: string }[],
-): string {
-  return (
-    `Please read the notes below and be ready to answer questions about them. ` +
-    `If there's no information about a certain topic, just say the note ` +
-    `does not mention it. ` +
-    `The content of the note is between "/***/":\n\n/***/\n\n${JSON.stringify(notes)}\n\n/***/\n\n` +
-    `Please reply with the following word for word:` +
-    `"OK I've read these notes. ` +
-    `Feel free to ask related questions, such as 'give me a summary of these notes in bullet points', 'what key questions does these notes answer', etc. "\n`
-  );
-}
-
-function getNoteTitleAndTags(noteWithTag: {
-  name: string;
+export interface ChatHistoryEntry {
+  role: "user" | "assistant";
   content: string;
-  tags?: string[];
-}): string {
-  return (
-    `[[${noteWithTag.name}]]` +
-    (noteWithTag.tags && noteWithTag.tags.length > 0
-      ? `\ntags: ${noteWithTag.tags.join(",")}`
-      : "")
-  );
 }
 
-function getChatContextStr(
-  chatNoteContextPath: string,
-  chatNoteContextTags: string[],
-): string {
-  const pathStr = chatNoteContextPath
-    ? `\nChat context by path: ${chatNoteContextPath}`
-    : "";
-  const tagsStr =
-    chatNoteContextTags?.length > 0
-      ? `\nChat context by tags: ${chatNoteContextTags}`
-      : "";
-  return pathStr + tagsStr;
-}
-
-export function getSendChatContextNotesPrompt(
-  notes: { name: string; content: string }[],
-  chatNoteContextPath: string,
-  chatNoteContextTags: string[],
-): string {
-  const noteTitles = notes
-    .map((note) => getNoteTitleAndTags(note))
-    .join("\n\n");
-  return (
-    `Please read the notes below and be ready to answer questions about them. ` +
-    getChatContextStr(chatNoteContextPath, chatNoteContextTags) +
-    `\n\n${noteTitles}`
-  );
-}
-
-export function fixGrammarSpellingSelectionPrompt(
-  selectedText: string,
-): string {
-  return (
-    `Please fix the grammar and spelling of the following text and return it without any other changes:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function summarizePrompt(selectedText: string): string {
-  return (
-    `Summarize the following text into bullet points and return it without any other changes. Identify the input language, and return the summary in the same language. If the input is English, return the summary in English. Otherwise, return in the same language as the input. Return ONLY the summary, DO NOT return the name of the language:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function tocPrompt(selectedText: string): string {
-  return (
-    `Please generate a table of contents for the following text and return it without any other changes. Output in the same language as the source, do not output English if it is not English:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function glossaryPrompt(selectedText: string): string {
-  return (
-    `Please generate a glossary for the following text and return it without any other changes. Output in the same language as the source, do not output English if it is not English:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function simplifyPrompt(selectedText: string): string {
-  return (
-    `Please simplify the following text so that a 6th-grader can understand. Output in the same language as the source, do not output English if it is not English:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function emojifyPrompt(selectedText: string): string {
-  return (
-    `Please insert emojis to the following content without changing the text.` +
-    `Insert at as many places as possible, but don't have any 2 emojis together. The original text must be returned.\n` +
-    `Content: ${selectedText}`
-  );
-}
-
-export function removeUrlsFromSelectionPrompt(selectedText: string): string {
-  return (
-    `Please remove all URLs from the following text and return it without any other changes:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function rewriteTweetSelectionPrompt(selectedText: string): string {
-  return `Please rewrite the following content to under 280 characters using simple sentences. Output in the same language as the source, do not output English if it is not English. Please follow the instruction strictly. Content:\n
-    + ${selectedText}`;
-}
-
-export function rewriteTweetThreadSelectionPrompt(
-  selectedText: string,
-): string {
-  return (
-    `Please follow the instructions closely step by step and rewrite the content to a thread. ` +
-    `1. Each paragraph must be under 240 characters. ` +
-    `2. The starting line is \`THREAD START\n\`, and the ending line is \`\nTHREAD END\`. ` +
-    `3. You must use \`\n\n---\n\n\` to separate each paragraph! Then return it without any other changes. ` +
-    `4. Make it as engaging as possible.` +
-    `5. Output in the same language as the source, do not output English if it is not English.\n The original content:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function rewriteShorterSelectionPrompt(selectedText: string): string {
-  return (
-    `Please rewrite the following text to make it half as long while keeping the meaning as much as possible. Output in the same language as the source, do not output English if it is not English:\n` +
-    `${selectedText}`
-  );
-}
-
-export function rewriteLongerSelectionPrompt(selectedText: string): string {
-  return (
-    `Please rewrite the following text to make it twice as long while keeping the meaning as much as possible. Output in the same language as the source, do not output English if it is not English:\n` +
-    `${selectedText}`
-  );
-}
-
-export function eli5SelectionPrompt(selectedText: string): string {
-  return (
-    `Please explain the following text like I'm 5 years old. Output in the same language as the source, do not output English if it is not English:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function rewritePressReleaseSelectionPrompt(
-  selectedText: string,
-): string {
-  return (
-    `Please rewrite the following text to make it sound like a press release. Output in the same language as the source, do not output English if it is not English:\n\n` +
-    `${selectedText}`
-  );
-}
-
-export function createTranslateSelectionPrompt(language?: string) {
-  return (selectedText: string): string => {
-    return (
-      `Please translate the following text to ${language}:\n\n` +
-      `${selectedText}`
-    );
-  };
-}
-
-export function createChangeToneSelectionPrompt(tone?: string) {
-  return (selectedText: string): string => {
-    return (
-      `Please change the tone of the following text to ${tone}. Output in the same language as the source, do not output English if it is not English:\n\n` +
-      `${selectedText}`
-    );
-  };
-}
-
-export function extractChatHistory(
-  memoryVariables: MemoryVariables,
-): [string, string][] {
-  const chatHistory: [string, string][] = [];
-  const { history } = memoryVariables;
+/**
+ * Extract text-only chat history from memory variables.
+ * This function pairs messages by index (i, i+1) and returns only string content.
+ *
+ * Note: For multimodal chains (CopilotPlus, AutonomousAgent), use
+ * chatHistoryUtils.processRawChatHistory instead to preserve image content.
+ *
+ * @param memoryVariables Memory variables from LangChain memory
+ * @returns Array of text-only chat history entries
+ */
+// TODO: Deprecated, use chatHistoryUtils.processRawChatHistory instead
+export function extractChatHistory(memoryVariables: MemoryVariables): ChatHistoryEntry[] {
+  const chatHistory: ChatHistoryEntry[] = [];
+  const history = memoryVariables.history as Array<{ content?: string }>;
 
   for (let i = 0; i < history.length; i += 2) {
     const userMessage = history[i]?.content || "";
     const aiMessage = history[i + 1]?.content || "";
-    chatHistory.push([userMessage, aiMessage]);
+
+    chatHistory.push(
+      { role: "user", content: userMessage },
+      { role: "assistant", content: aiMessage }
+    );
   }
 
   return chatHistory;
 }
 
-export function extractNoteTitles(query: string): string[] {
-  // Use a regular expression to extract note titles wrapped in [[]]
-  const regex = /\[\[(.*?)\]\]/g;
-  const matches = query.match(regex);
-  const uniqueTitles = new Set(
-    matches ? matches.map((match) => match.slice(2, -2)) : [],
-  );
-  return Array.from(uniqueTitles);
+/**
+ * Core logic for extracting note files from wikilink patterns.
+ * Resolves note titles/paths to TFile objects, handling both unique titles and full paths.
+ *
+ * @param noteTitles - Array of note title/path strings extracted from wikilinks
+ * @param vault - Obsidian vault instance
+ * @returns Array of unique TFile objects
+ */
+function resolveNoteFilesFromTitles(noteTitles: string[], vault: Vault): TFile[] {
+  const uniqueFiles = new Map<string, TFile>();
+
+  noteTitles.forEach((noteTitle) => {
+    // First try to get file by full path
+    const file = vault.getAbstractFileByPath(noteTitle);
+
+    if (file instanceof TFile) {
+      // Found by path, use it directly
+      uniqueFiles.set(file.path, file);
+    } else {
+      // Try to find by title
+      const files = vault.getMarkdownFiles();
+      const matchingFiles = files.filter((f) => f.basename === noteTitle);
+
+      if (matchingFiles.length > 0) {
+        if (isNoteTitleUnique(noteTitle, vault)) {
+          // Only one file with this title, use it
+          uniqueFiles.set(matchingFiles[0].path, matchingFiles[0]);
+        } else {
+          // Multiple files with same title - this shouldn't happen
+          // as we should be using full paths for duplicate titles
+          logWarn(
+            `Found multiple files with title "${noteTitle}". Expected a full path for duplicate titles.`
+          );
+        }
+      }
+    }
+  });
+
+  return Array.from(uniqueFiles.values());
 }
 
 /**
- * Process the variable name to generate a note path if it's enclosed in double brackets, otherwise return the variable name as is.
+ * Extract note files from text containing wikilinks: [[note title]]
+ * Used by search/retrieval systems to find explicitly mentioned notes.
+ *
+ * @param query - Text containing [[...]] patterns
+ * @param vault - Obsidian vault instance
+ * @returns Array of unique TFile objects matching the [[...]] patterns
+ */
+export function extractNoteFiles(query: string, vault: Vault): TFile[] {
+  // Use a regular expression to extract note titles and paths wrapped in [[]]
+  const regex = /\[\[(.*?)\]\]/g;
+  const matches = query.match(regex);
+
+  if (!matches) {
+    return [];
+  }
+
+  // Extract inner content from [[...]]
+  const noteTitles = matches.map((match) => match.slice(2, -2));
+  return resolveNoteFilesFromTitles(noteTitles, vault);
+}
+
+/**
+ * Extract note files from text containing wikilinks wrapped in curly braces: {[[note title]]}
+ * This is specifically for custom prompt templating where only {[[...]]} syntax should trigger
+ * note content inclusion.
+ *
+ * @param query - Text containing {[[...]]} patterns
+ * @param vault - Obsidian vault instance
+ * @returns Array of unique TFile objects matching the {[[...]]} patterns
+ */
+export function extractTemplateNoteFiles(query: string, vault: Vault): TFile[] {
+  // Use a regular expression to extract note titles and paths wrapped in {[[]]}
+  const regex = /\{\[\[(.*?)\]\]\}/g;
+  const matches = query.match(regex);
+
+  if (!matches) {
+    return [];
+  }
+
+  // Extract inner content from {[[...]]}
+  const noteTitles = matches.map((match) => match.slice(3, -3));
+  return resolveNoteFilesFromTitles(noteTitles, vault);
+}
+
+// Helper function to check if a note title is unique in the vault
+function isNoteTitleUnique(title: string, vault: Vault): boolean {
+  const files = vault.getMarkdownFiles();
+  return files.filter((f) => f.basename === title).length === 1;
+}
+
+/**
+ * Process the variable name to generate a note path if it's enclosed in double brackets,
+ * otherwise return the variable name as is.
  *
  * @param {string} variableName - The name of the variable to process
  * @return {string} The processed note path or the variable name itself
@@ -528,13 +565,840 @@ export function processVariableNameForNotePath(variableName: string): string {
   return variableName;
 }
 
-export function extractUniqueTitlesFromDocs(docs: Document[]): string[] {
-  const titlesSet = new Set<string>();
-  docs.forEach((doc) => {
-    if (doc.metadata?.title) {
-      titlesSet.add(doc.metadata?.title);
+const YOUTUBE_URL_REGEX =
+  /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([^\s&]+)/;
+
+/**
+ * Validates a YouTube URL and returns detailed validation result
+ */
+export function validateYoutubeUrl(url: string): {
+  isValid: boolean;
+  error?: string;
+  videoId?: string;
+} {
+  if (!url || typeof url !== "string") {
+    return { isValid: false, error: "URL is required" };
+  }
+
+  const trimmedUrl = url.trim();
+  if (!trimmedUrl) {
+    return { isValid: false, error: "URL cannot be empty" };
+  }
+
+  // Extract video ID
+  const videoId = extractYoutubeVideoId(trimmedUrl);
+  if (!videoId) {
+    return { isValid: false, error: "Invalid YouTube URL format" };
+  }
+
+  // Check if video ID is valid (11 characters, alphanumeric with dashes and underscores)
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    return { isValid: false, error: "Invalid YouTube video ID" };
+  }
+
+  return { isValid: true, videoId };
+}
+
+/**
+ * Extract YouTube video ID from various URL formats
+ */
+export function extractYoutubeVideoId(url: string): string | null {
+  try {
+    // Handle different YouTube URL formats
+    const patterns = [
+      /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/)([a-zA-Z0-9_-]{11})/,
+      /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/,
+    ];
+
+    for (const pattern of patterns) {
+      const match = url.match(pattern);
+      if (match && match[1]) {
+        return match[1];
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create a standard YouTube URL from video ID
+ */
+export function formatYoutubeUrl(videoId: string): string {
+  return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+/**
+ * Check if a string is a valid YouTube URL (legacy function for backward compatibility)
+ */
+export function isYoutubeUrl(url: string): boolean {
+  return validateYoutubeUrl(url).isValid;
+}
+
+/**
+ * Check if a URL is a Twitter/X URL (e.g. tweet or post link)
+ */
+export function isTwitterUrl(url: string): boolean {
+  if (!url || typeof url !== "string") return false;
+  try {
+    const urlObj = new URL(url.trim());
+    return (
+      (urlObj.hostname === "x.com" ||
+        urlObj.hostname === "www.x.com" ||
+        urlObj.hostname === "twitter.com" ||
+        urlObj.hostname === "www.twitter.com") &&
+      urlObj.pathname.includes("/status/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extract all YouTube URLs from text (legacy function for backward compatibility)
+ */
+export function extractAllYoutubeUrls(text: string): string[] {
+  const matches = text.matchAll(new RegExp(YOUTUBE_URL_REGEX, "g"));
+  return Array.from(matches, (match) => match[0]);
+}
+
+/**
+ * Proxy function to use in place of fetch() to bypass CORS restrictions.
+ * Uses Obsidian's requestUrl which bypasses browser CORS restrictions.
+ *
+ * @param url - The URL to fetch
+ * @param options - Fetch options (subset of RequestInit)
+ * @param options.throwOnHttpError - If true (default), throws on HTTP >= 400. Set to false for fetch-like behavior.
+ *
+ * @remarks
+ * **AbortSignal Limitation**: The `signal` option is accepted for API compatibility
+ * but is NOT honored by the underlying `requestUrl` implementation. Requests made
+ * through this function cannot be cancelled via AbortSignal. If cancellation is
+ * required, use native `fetch` instead (which may encounter CORS issues on mobile).
+ *
+ * **Streaming Limitation**: This function does not support true streaming responses.
+ * The entire response body is buffered before being returned.
+ *
+ * @see https://forum.obsidian.md/t/support-streaming-the-request-and-requesturl-response-body/87381
+ */
+export async function safeFetch(
+  url: string,
+  options: RequestInit & { throwOnHttpError?: boolean } = {}
+): Promise<Response> {
+  const { throwOnHttpError = true } = options;
+  // Initialize headers if not provided
+  const normalizedHeaders = new Headers(options.headers);
+  const headers = Object.fromEntries(normalizedHeaders.entries());
+
+  // Remove content-length if it exists
+  delete (headers as Record<string, string>)["content-length"];
+
+  logInfo("safeFetch request");
+
+  const method = options.method?.toUpperCase() || "POST";
+  const methodsWithBody = ["POST", "PUT", "PATCH"];
+
+  const response = await requestUrl({
+    url,
+    contentType: "application/json",
+    headers: headers,
+    method: method,
+    ...(methodsWithBody.includes(method) &&
+      typeof options.body === "string" && { body: options.body }),
+    throw: false, // Don't throw so we can get the response body
+  });
+
+  // Check if response is error status (only throw if throwOnHttpError is true)
+  if (throwOnHttpError && response.status >= 400) {
+    type ErrorJson = {
+      detail?: { reason?: string; message?: string } | string;
+      reason?: string;
+      message?: string;
+    };
+    let errorJson: ErrorJson | null = null;
+    try {
+      errorJson = (
+        typeof response.json === "string" ? JSON.parse(response.json) : response.json
+      ) as ErrorJson;
+    } catch {
+      try {
+        errorJson = (
+          typeof response.text === "string" ? JSON.parse(response.text) : response.text
+        ) as ErrorJson;
+      } catch {
+        errorJson = null;
+      }
+    }
+
+    // Create error with proper structure
+    const error = new Error(ERROR_MESSAGES.REQUEST_FAILED(response.status)) as APIError;
+    error.json = errorJson;
+
+    // Handle nested error structure
+    const detail = errorJson && typeof errorJson.detail === "object" ? errorJson.detail : undefined;
+    if (detail?.reason === "Invalid license key" || errorJson?.reason === "Invalid license key") {
+      error.message = "Invalid license key";
+    } else if (detail?.message || errorJson?.message) {
+      const message = detail?.message || errorJson?.message;
+      const reason = detail?.reason || errorJson?.reason;
+      error.message = reason ? `${message}: ${reason}` : (message ?? "");
+    } else if (errorJson?.detail) {
+      error.message = JSON.stringify(errorJson.detail);
+    } else if (errorJson) {
+      // for external error, add more msg
+      error.message += ". " + JSON.stringify(errorJson);
+    }
+
+    throw error;
+  }
+
+  return {
+    ok: response.status >= 200 && response.status < 300,
+    status: response.status,
+    statusText: response.status.toString(),
+    headers: new Headers(response.headers),
+    url: url,
+    type: "basic" as ResponseType,
+    redirected: false,
+    bytes: () => Promise.resolve(new Uint8Array(0)),
+    body: createReadableStreamFromString(response.text),
+    bodyUsed: true,
+    json: (): Promise<unknown> => Promise.resolve(response.json as unknown),
+    text: async () => response.text,
+    arrayBuffer: async () => {
+      if (response.arrayBuffer) {
+        return response.arrayBuffer;
+      }
+      const base64 = response.text.replace(/^data:.*;base64,/, "");
+      // Reason: Buffer (from the `buffer` polyfill imported above) is the
+      // cross-platform path — bare global Buffer is undefined in mobile WebView.
+      const buf = Buffer.from(base64, "base64");
+      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    },
+    blob: () => {
+      throw new Error("not implemented");
+    },
+    formData: () => {
+      throw new Error("not implemented");
+    },
+    clone: () => {
+      throw new Error("not implemented");
+    },
+  };
+}
+
+/**
+ * Wrapper around safeFetch that doesn't throw on HTTP errors (fetch-like behavior).
+ * Use this when you need to check response.status for retry logic (e.g., 401 token refresh).
+ *
+ * This is also the variant to hand a provider SDK as its `fetch`. `fetch` never
+ * throws on a 4xx, so an SDK given a throwing implementation reads a rejected
+ * request as a dead connection: it reports "Connection error" instead of the
+ * provider's own message and burns its whole retry budget on a request that can
+ * never succeed. https://github.com/logancyang/obsidian-copilot/issues/2959
+ *
+ * @remarks
+ * Inherits all limitations from safeFetch:
+ * - AbortSignal is NOT honored (requests cannot be cancelled)
+ * - No true streaming support (response is fully buffered)
+ *
+ * @see safeFetch for full documentation
+ */
+export function safeFetchNoThrow(url: string, options: RequestInit = {}): Promise<Response> {
+  return safeFetch(url, { ...options, throwOnHttpError: false });
+}
+
+function createReadableStreamFromString(input: string) {
+  return new ReadableStream({
+    start(controller) {
+      // Convert the input string to a Uint8Array
+      const encoder = new TextEncoder();
+      const uint8Array = encoder.encode(input);
+
+      // Push the data to the stream
+      controller.enqueue(uint8Array);
+
+      // Close the stream
+      controller.close();
+    },
+  });
+}
+
+// err2String is now exported from '@/errorFormat' to avoid circular dependencies and duplication.
+
+export function omit<T extends object, K extends keyof T>(obj: T, keys: K[]): Omit<T, K> {
+  const result = { ...obj };
+  keys.forEach((key) => {
+    delete result[key];
+  });
+  return result;
+}
+
+// Capabilities can be undefined when a model's vision support is simply unknown;
+// callers that hard-block on missing vision must treat undefined as "unknown", not "no".
+export function modelSupportsVision(model: CustomModel): boolean {
+  return !!model.capabilities?.includes(ModelCapability.VISION);
+}
+
+/**
+ * Cleans a message by removing Think blocks, Action blocks (writeFile), tool call markers,
+ * and agent reasoning blocks for copying to clipboard or inserting at cursor.
+ * This is more comprehensive than removeThinkTags which is used for RAG.
+ */
+export function cleanMessageForCopy(message: string): string {
+  let cleanedMessage = message;
+
+  // First use the existing removeThinkTags function
+  cleanedMessage = removeThinkTags(cleanedMessage);
+
+  // Remove writeFile blocks wrapped in XML codeblocks (also handles legacy writeToFile tag)
+  cleanedMessage = cleanedMessage.replace(
+    /```xml\s*[\s\S]*?<write(?:File|ToFile)>[\s\S]*?<\/write(?:File|ToFile)>[\s\S]*?```/g,
+    ""
+  );
+
+  // Remove standalone writeFile/writeToFile blocks
+  cleanedMessage = cleanedMessage.replace(
+    /<write(?:File|ToFile)>[\s\S]*?<\/write(?:File|ToFile)>/g,
+    ""
+  );
+
+  // Remove tool call markers
+  // Format: <!--TOOL_CALL_START:id:toolName:displayName:emoji:confirmationMessage:isExecuting-->content<!--TOOL_CALL_END:id:result-->
+  cleanedMessage = cleanedMessage.replace(
+    /<!--TOOL_CALL_START:[^:]+:[^:]+:[^:]+:[^:]+:[^:]*:[^:]+-->[\s\S]*?<!--TOOL_CALL_END:[^:]+:[\s\S]*?-->/g,
+    ""
+  );
+
+  // Remove agent reasoning blocks
+  // Format: <!--AGENT_REASONING:status:elapsed:["step1","step2"]-->
+  // Use greedy .* so we match to the real closing --> even if the JSON payload contains -->
+  cleanedMessage = cleanedMessage.replace(/<!--AGENT_REASONING:\w+:\d+:.*-->/g, "");
+
+  // Clean up any resulting multiple consecutive newlines (more than 2)
+  cleanedMessage = cleanedMessage.replace(/\n{3,}/g, "\n\n");
+
+  // Trim leading and trailing whitespace
+  cleanedMessage = cleanedMessage.trim();
+
+  return cleanedMessage;
+}
+
+/**
+ * Inserts text at the cursor of the most recent markdown editor, replacing the
+ * current selection when there is one. Resolves the target leaf via the passed
+ * `app` (no global `app`) and threads that same `app` into `insertIntoEditor`
+ * so selection detection and insertion always target the same editor — even in
+ * a popout window where the global `app` would resolve a different leaf.
+ */
+export async function insertAtCursor(app: App, text: string) {
+  let leaf = app.workspace.getMostRecentLeaf();
+  if (!leaf || !(leaf.view instanceof MarkdownView)) {
+    leaf = app.workspace.getLeaf(false);
+    if (!leaf || !(leaf.view instanceof MarkdownView)) return;
+  }
+  const hasSelection = leaf.view.editor.getSelection().length > 0;
+  await insertIntoEditor(app, text, hasSelection);
+}
+
+/**
+ * Inserts a message into the active markdown editor, optionally replacing the current selection.
+ * Uses a single CM6 transaction to avoid undo stack splitting.
+ * Ensures the inserted/replaced range is selected after the operation.
+ *
+ * Resolves the target leaf from the passed `app` (not the global) so the write
+ * lands in the caller's window — critical for popout-window chats.
+ */
+export async function insertIntoEditor(app: App, message: string, replace: boolean = false) {
+  let leaf = app.workspace.getMostRecentLeaf();
+  if (!leaf) {
+    new Notice("No active leaf found.");
+    return;
+  }
+
+  if (!(leaf.view instanceof MarkdownView)) {
+    leaf = app.workspace.getLeaf(false);
+    await leaf.setViewState({ type: "markdown", state: leaf.view.getState() });
+  }
+
+  if (!(leaf.view instanceof MarkdownView)) {
+    new Notice("Failed to open a markdown view.");
+    return;
+  }
+
+  const editor = leaf.view.editor;
+  const cursorFrom = editor.getCursor("from");
+  const cursorTo = editor.getCursor("to");
+
+  // Clean the message before inserting (removes think tags, writeFile blocks, tool calls)
+  const cleanedMessage = cleanMessageForCopy(message);
+  const cleanedLines = cleanedMessage.split("\n");
+
+  /** Computes the end editor position after inserting text at start position */
+  const getEndPosition = (
+    start: { line: number; ch: number },
+    textLines: string[]
+  ): { line: number; ch: number } => {
+    const lineDelta = textLines.length - 1;
+    if (lineDelta === 0) {
+      return { line: start.line, ch: start.ch + (textLines[0]?.length ?? 0) };
+    }
+    return { line: start.line + lineDelta, ch: textLines[textLines.length - 1]?.length ?? 0 };
+  };
+
+  /** Inserts via Obsidian Editor API (fallback when CM6 unavailable or dispatch fails) */
+  const insertWithEditorAPI = (): void => {
+    const changeFrom = replace ? cursorFrom : cursorTo;
+    editor.replaceRange(cleanedMessage, changeFrom, cursorTo);
+    editor.setSelection(changeFrom, getEndPosition(changeFrom, cleanedLines));
+  };
+
+  /** Focuses the editor and shows success notice */
+  const finalizeInsertion = (): void => {
+    editor.focus();
+    new Notice("Message inserted into the active note.");
+  };
+
+  // Check if CM6 EditorView is available and valid
+  const view = editor.cm;
+  const isCM6View = view?.state?.doc && typeof view.dispatch === "function";
+
+  if (!isCM6View) {
+    insertWithEditorAPI();
+    finalizeInsertion();
+    return;
+  }
+
+  // Use CM6 selection offsets directly (simpler than manual line/ch conversion)
+  const { from, to } = view.state.selection.main;
+  const changeFrom = replace ? from : to;
+
+  // Use CM6's toText to handle CRLF normalization correctly
+  // (CM6 treats \r\n as single newline, so string.length would be wrong)
+  const insertText = view.state.toText(cleanedMessage);
+  const endOffset = changeFrom + insertText.length;
+
+  try {
+    // Single transaction: text change + selection change
+    view.dispatch({
+      changes: { from: changeFrom, to, insert: insertText },
+      selection: { anchor: changeFrom, head: endOffset },
+    });
+  } catch (e) {
+    // Fallback to Obsidian API if CM6 dispatch fails
+    logWarn("CM6 dispatch failed, falling back to Obsidian API", e);
+    insertWithEditorAPI();
+  }
+
+  finalizeInsertion();
+}
+
+export { debounce } from "@/utils/debounce";
+
+/**
+ * Whether a released version has a newer major/minor/patch than the installed build.
+ * @param latest - Version from the released plugin manifest.
+ * @param current - Installed manifest version, possibly carrying a development suffix.
+ */
+export function isNewerVersion(latest: string, current: string): boolean {
+  return compareSemver(latest, current) > 0;
+}
+
+const LATEST_RELEASE_API_URL =
+  "https://api.github.com/repos/logancyang/obsidian-copilot/releases/latest";
+
+export interface LatestRelease {
+  body: string;
+  htmlUrl: string;
+  version: string;
+}
+
+interface GitHubReleaseResponse {
+  body?: unknown;
+  html_url?: unknown;
+  assets?: { name?: unknown; browser_download_url?: unknown }[];
+}
+
+/** Read the latest release's installable manifest version and its release notes. */
+export async function checkLatestVersion(): Promise<{
+  version: string | null;
+  error: string | null;
+  release: LatestRelease | null;
+}> {
+  try {
+    const response = await requestUrl({
+      url: LATEST_RELEASE_API_URL,
+      method: "GET",
+    });
+    const responseRelease = response.json as GitHubReleaseResponse;
+    const manifestAsset = Array.isArray(responseRelease?.assets)
+      ? responseRelease.assets.find((asset) => asset?.name === "manifest.json")
+      : undefined;
+    if (
+      typeof manifestAsset?.browser_download_url !== "string" ||
+      !manifestAsset.browser_download_url
+    ) {
+      throw new Error("The latest Copilot release has no manifest.json asset.");
+    }
+    // The installed plugin gets its version from this asset; a release tag can differ.
+    const manifestResponse = await requestUrl({
+      url: manifestAsset.browser_download_url,
+      method: "GET",
+    });
+    const manifest = manifestResponse.json as { version?: unknown } | null;
+    const version = manifest?.version;
+    if (
+      typeof version !== "string" ||
+      !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[\da-zA-Z-]+(?:\.[\da-zA-Z-]+)*)?(?:\+[\da-zA-Z-]+(?:\.[\da-zA-Z-]+)*)?$/.test(
+        version
+      )
+    ) {
+      throw new Error("The latest Copilot manifest has no valid version.");
+    }
+
+    const release: LatestRelease = {
+      body: typeof responseRelease.body === "string" ? responseRelease.body : "",
+      htmlUrl:
+        typeof responseRelease.html_url === "string"
+          ? responseRelease.html_url
+          : "https://github.com/logancyang/obsidian-copilot/releases/latest",
+      version,
+    };
+    return {
+      version: release.version,
+      error: null,
+      release,
+    };
+  } catch (error) {
+    return {
+      version: null,
+      error: error instanceof Error ? error.message : "Failed to check for updates",
+      release: null,
+    };
+  }
+}
+
+// Note: LangChain 0.6.6+ handles O-series and GPT-5 models automatically
+// These functions are kept for backward compatibility and specific checks
+export function isOSeriesModel(model: BaseChatModel | string): boolean {
+  if (typeof model === "string") {
+    return model.startsWith("o1") || model.startsWith("o3") || model.startsWith("o4");
+  }
+
+  // For BaseChatModel instances
+  const m = model as unknown as Record<string, unknown>;
+  const modelName: string = (m.modelName as string) || (m.model as string) || "";
+  return modelName.startsWith("o1") || modelName.startsWith("o3") || modelName.startsWith("o4");
+}
+
+function isGPT5Model(model: BaseChatModel | string): boolean {
+  if (typeof model === "string") {
+    return model.startsWith("gpt-5");
+  }
+
+  // For BaseChatModel instances
+  const m = model as unknown as Record<string, unknown>;
+  const modelName: string = (m.modelName as string) || (m.model as string) || "";
+  return modelName.startsWith("gpt-5");
+}
+
+/**
+ * Utility for determining model characteristics
+ * Note: Most of this is handled by LangChain 0.6.6+ internally
+ */
+export interface ModelInfo {
+  isOSeries: boolean;
+  isGPT5: boolean;
+  isThinkingEnabled: boolean;
+  usesAdaptiveThinking: boolean;
+}
+
+export function getModelInfo(model: BaseChatModel | string): ModelInfo {
+  const m = model as unknown as Record<string, unknown>;
+  const modelName: string =
+    typeof model === "string" ? model : (m.modelName as string) || (m.model as string) || "";
+
+  const isOSeries = isOSeriesModel(modelName);
+  const isGPT5 = isGPT5Model(modelName);
+  const isThinkingEnabled =
+    modelName.startsWith("claude-3-7-sonnet") ||
+    modelName.startsWith("claude-sonnet-4") ||
+    modelName.startsWith("claude-opus-4");
+
+  // claude-opus-4-7 and later reject the legacy { type: "enabled", budget_tokens } shape
+  // with a 400 and require { type: "adaptive" }. Detect by minor version on the opus-4 line.
+  // Constrain the minor to 1-2 digits followed by a delimiter or end-of-string so dated
+  // snapshot IDs (e.g. "claude-opus-4-20250514") aren't misread as Opus 4.20250514.
+  const opusMinorMatch = modelName.match(/^claude-opus-4-(\d{1,2})(?:[-.]|$)/);
+  const usesAdaptiveThinking = opusMinorMatch ? parseInt(opusMinorMatch[1], 10) >= 7 : false;
+
+  return {
+    isOSeries,
+    isGPT5,
+    isThinkingEnabled,
+    usesAdaptiveThinking,
+  };
+}
+
+export function getMessageRole(
+  model: BaseChatModel | string,
+  defaultRole: "system" | "human" = "system"
+): "system" | "human" {
+  return isOSeriesModel(model) ? "human" : defaultRole;
+}
+
+/**
+ * Extracts text content from a message chunk that could be either a string
+ * or an array of content objects (Claude 3.7 format)
+ */
+export function extractTextFromChunk(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return (content as Array<{ type?: string; text?: string }>)
+      .filter((item) => item.type === "text")
+      .map((item) => item.text ?? "")
+      .join("");
+  }
+  // For any other type, return empty string
+  return "";
+}
+
+/**
+ * Removes any <think> tags and their content from the text.
+ * This is used to clean model outputs before using them for RAG.
+ * Handles both string content and array-based content (Claude 3.7 format)
+ * @param text - The text or content array to remove think tags from
+ * @returns The text with think tags removed
+ */
+export function removeThinkTags(text: unknown): string {
+  // First convert any content format to plain text
+  const plainText = extractTextFromChunk(text);
+  // Remove complete think tags and their content
+  let cleanedText = plainText.replace(/<think>[\s\S]*?<\/think>/g, "");
+  // Remove any remaining unclosed think tags (for streaming scenarios)
+  cleanedText = cleanedText.replace(/<think>[\s\S]*$/g, "");
+  return cleanedText.trim();
+}
+
+/**
+ * Removes any <errorChunk> tags and their content from the text.
+ * This is used to clean model outputs before using them for RAG.
+ * Handles both string content and array-based content (Claude 3.7 format)
+ * @param text - The text or content array to remove error tags from
+ * @returns The text with error tags removed
+ */
+export function removeErrorTags(text: unknown): string {
+  // First convert any content format to plain text
+  const plainText = extractTextFromChunk(text);
+  // Then remove error tags
+  return plainText.replace(/<errorChunk>[\s\S]*?<\/errorChunk>/g, "").trim();
+}
+
+export function randomUUID() {
+  return crypto.randomUUID();
+}
+
+/**
+ * Executes a function with token counting warnings suppressed
+ * This can be used anywhere in the codebase where token counting warnings should be suppressed
+ * @param fn The function to execute without token counting warnings
+ * @returns The result of the function
+ */
+export async function withSuppressedTokenWarnings<T>(fn: () => Promise<T>): Promise<T> {
+  // Store original console.warn
+  const originalWarn = console.warn;
+
+  try {
+    // Replace with filtered version
+    console.warn = function (...args: unknown[]) {
+      // Ignore token counting warnings
+      const first = args[0];
+      if (
+        typeof first === "string" &&
+        (first.includes("Failed to calculate number of tokens") || first.includes("Unknown model"))
+      ) {
+        return;
+      }
+      // Pass through other warnings
+      originalWarn.apply(console, args);
+    };
+
+    // Execute the provided function
+    return await fn();
+  } finally {
+    // Always restore original console.warn, even if an error occurs
+    console.warn = originalWarn;
+  }
+}
+
+/**
+ * Execute an operation with a timeout using AbortController for proper cancellation
+ * @param operation - Function that accepts an AbortSignal and returns a Promise
+ * @param timeoutMs - Timeout in milliseconds
+ * @param operationName - Name of the operation for error messages
+ * @returns Promise that resolves with the operation result or rejects with TimeoutError
+ */
+export async function withTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  operationName: string = "Operation"
+): Promise<T> {
+  const { TimeoutError } = await import("@/error");
+
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await Promise.race([
+      operation(controller.signal),
+      new Promise<never>((_, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          reject(new TimeoutError(operationName, timeoutMs));
+        });
+      }),
+    ]);
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Check if the current Obsidian editor setting is in source mode
+ */
+export function isSourceModeOn(app: App): boolean {
+  const view = app.workspace.getActiveViewOfType(MarkdownView);
+  if (!view) return true;
+
+  const state = view.getState() as { source?: boolean };
+  return state.source === true;
+}
+
+/**
+ * Calculate the UTF-8 byte length of a string.
+ * This is important for filesystem operations where filename limits are in bytes, not characters.
+ * @param str - The string to measure
+ * @returns The byte length when encoded as UTF-8
+ */
+export function getUtf8ByteLength(str: string): number {
+  // Use TextEncoder which always uses UTF-8 encoding
+  return new TextEncoder().encode(str).length;
+}
+
+/**
+ * Truncate a string to fit within a byte limit, ensuring UTF-8 character boundaries are respected.
+ * This prevents cutting multibyte UTF-8 sequences in the middle.
+ * @param str - The string to truncate
+ * @param byteLimit - Maximum number of bytes (not characters)
+ * @returns The truncated string that fits within the byte limit
+ */
+export function truncateToByteLimit(str: string, byteLimit: number): string {
+  if (byteLimit <= 0) {
+    return "";
+  }
+
+  // Fast path: if string already fits, return as-is
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(str);
+  if (bytes.length <= byteLimit) {
+    return str;
+  }
+
+  // Binary search to find the longest prefix that fits
+  let low = 0;
+  let high = str.length;
+  let result = "";
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = str.substring(0, mid);
+    const candidateBytes = encoder.encode(candidate);
+
+    if (candidateBytes.length <= byteLimit) {
+      // This candidate fits, try a longer one
+      result = candidate;
+      low = mid + 1;
+    } else {
+      // This candidate is too long, try a shorter one
+      high = mid - 1;
+    }
+  }
+
+  return result;
+}
+
+/** Maximum filename (basename) length in bytes for most filesystems (ext4, NTFS, APFS). */
+const MAX_FILENAME_BYTES = 255;
+
+/**
+ * Sanitize a vault-relative file path by truncating the basename if it exceeds
+ * filesystem filename length limits. Preserves the file extension.
+ * @param filePath - Vault-relative file path
+ * @returns The sanitized path with basename truncated if necessary
+ */
+export function sanitizeFilePath(filePath: string): string {
+  const parts = filePath.split("/");
+  const basename = parts[parts.length - 1];
+
+  if (getUtf8ByteLength(basename) <= MAX_FILENAME_BYTES) {
+    return filePath;
+  }
+
+  const extIndex = basename.lastIndexOf(".");
+  const ext = extIndex >= 0 ? basename.substring(extIndex) : "";
+  const name = extIndex >= 0 ? basename.substring(0, extIndex) : basename;
+
+  const extBytes = getUtf8ByteLength(ext);
+  const availableBytes = MAX_FILENAME_BYTES - extBytes;
+
+  if (availableBytes <= 0) {
+    parts[parts.length - 1] = truncateToByteLimit(basename, MAX_FILENAME_BYTES);
+  } else {
+    parts[parts.length - 1] = truncateToByteLimit(name, availableBytes) + ext;
+  }
+
+  return parts.join("/");
+}
+
+/**
+ * Opens a file in the workspace, reusing an existing tab if the file is already open.
+ * @param app - The Obsidian app instance
+ * @param file - The TFile to open
+ * @param focusIfOpen - If true, focuses the existing leaf if the file is already open (default: true)
+ */
+export async function openFileInWorkspace(
+  app: App,
+  file: TFile,
+  focusIfOpen: boolean = true
+): Promise<void> {
+  // Check if the file is already open in any leaf
+  let existingLeaf = null;
+  app.workspace.iterateAllLeaves((leaf) => {
+    if (
+      leaf.view.getViewType() === "markdown" ||
+      leaf.view.getViewType() === "pdf" ||
+      leaf.view.getViewType() === "canvas"
+    ) {
+      const viewFile = (leaf.view as unknown as Record<string, unknown>).file as
+        | { path: string }
+        | undefined;
+      if (viewFile && viewFile.path === file.path) {
+        existingLeaf = leaf;
+      }
     }
   });
 
-  return Array.from(titlesSet);
+  if (existingLeaf && focusIfOpen) {
+    // File is already open, focus the existing leaf
+    app.workspace.setActiveLeaf(existingLeaf, { focus: true });
+  } else if (!existingLeaf) {
+    // File is not open, open it in a new tab
+    const leaf = app.workspace.getLeaf("tab");
+    await leaf.openFile(file);
+  }
 }

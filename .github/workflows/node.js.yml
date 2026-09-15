@@ -5,27 +5,55 @@ name: Node.js CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master", "main"]
   pull_request:
-    branches: [ "master" ]
+    # Run on all pull requests regardless of target branch
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        node-version: [20.x]
+        node-version: [22.x]
         # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
 
     steps:
-    - uses: actions/checkout@v3
-    - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v3
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'npm'
-    - run: npm ci
-    - run: npm run build --if-present
-    - run: npm test
+      - uses: actions/checkout@v3
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+      - run: npm ci
+      - name: Obsidian community review gate
+        run: npm run review:obsidian
+      - run: npm run lint
+      # Type-checks the project and bundles the plugin. Otherwise both run only
+      # when a release PR merges, so a break would sit on master until someone
+      # cut a release.
+      - run: npm run build
+      # Builds the component gallery's whole story graph, so a story that cannot
+      # bundle fails the PR instead of reaching master unnoticed.
+      - run: npm run gallery:build
+      - run: npm run test:mobile-load
+      - run: npm test
+      - name: Verify PR size labels
+        run: node --test scripts/pr-size.test.mjs
+
+  docs:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: "npm"
+          cache-dependency-path: docs/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build

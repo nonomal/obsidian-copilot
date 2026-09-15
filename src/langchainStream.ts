@@ -1,8 +1,12 @@
-import ChainManager from '@/LLMProviders/chainManager';
-import { ChatMessage } from '@/sharedState';
-import { Notice } from 'obsidian';
+import { AI_SENDER } from "@/constants";
+import ChainManager from "@/LLMProviders/chainManager";
+import { ChatMessage } from "@/types/message";
+import { err2String, formatDateTime } from "./utils";
+import { logError } from "@/logger";
+import { v4 as uuidv4 } from "uuid";
+import { formatErrorChunk } from "@/utils/toolResultUtils";
 
-export type Role = 'assistant' | 'user' | 'system';
+export type Role = "assistant" | "user" | "system";
 
 export const getAIResponse = async (
   userMessage: ChatMessage,
@@ -11,23 +15,33 @@ export const getAIResponse = async (
   updateCurrentAiMessage: (message: string) => void,
   updateShouldAbort: (abortController: AbortController | null) => void,
   options: {
-    debug?: boolean,
-    ignoreSystemMessage?: boolean,
-    updateLoading?: (loading: boolean) => void
-  } = {},
+    debug?: boolean;
+    ignoreSystemMessage?: boolean;
+    updateLoading?: (loading: boolean) => void;
+    updateLoadingMessage?: (message: string) => void;
+  } = {}
 ) => {
   const abortController = new AbortController();
   updateShouldAbort(abortController);
   try {
     await chainManager.runChain(
-      userMessage.message,
+      userMessage,
       abortController,
       updateCurrentAiMessage,
       addMessage,
-      options,
+      options
     );
   } catch (error) {
-    console.error('Model request failed:', error);
-    new Notice('Model request failed:', error);
+    logError("Model request failed:", error);
+    const errorMessage = formatErrorChunk("Model request failed: " + err2String(error));
+
+    addMessage({
+      id: uuidv4(),
+      sender: AI_SENDER,
+      isErrorMessage: true,
+      message: errorMessage,
+      isVisible: true,
+      timestamp: formatDateTime(new Date()),
+    });
   }
 };

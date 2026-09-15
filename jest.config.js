@@ -1,17 +1,35 @@
 module.exports = {
-  preset: 'ts-jest',
-  testEnvironment: 'jsdom',
-  roots: ['<rootDir>/src', '<rootDir>/tests'],
+  preset: "ts-jest",
+  testEnvironment: "jsdom",
+  roots: ["<rootDir>/src", "<rootDir>/dev", "<rootDir>/scripts"],
   transform: {
-    '^.+\\.(js|jsx|ts|tsx)$': 'ts-jest',
+    "^.+\\.(js|jsx|ts|tsx)$": "ts-jest",
+    "^.+\\.md$": "<rootDir>/jest.textTransform.js",
   },
   moduleNameMapper: {
-    '\\.(css|less|scss|sass)$': 'identity-obj-proxy',
-    '^@/(.*)$': '<rootDir>/src/$1',
-    '^obsidian$': '<rootDir>/__mocks__/obsidian.js'
+    "\\.svg$": "<rootDir>/__mocks__/svg.js",
+    "^@/(.*)$": "<rootDir>/src/$1",
+    "^obsidian$": "<rootDir>/__mocks__/obsidian.js",
+    // The yaml package's "exports" field defaults to a browser ESM entry under
+    // jsdom; Jest can't parse ESM without extra config, so point at the CJS
+    // build it ships under dist/.
+    "^yaml$": "<rootDir>/node_modules/yaml/dist/index.js",
+    // @anthropic-ai/sdk publishes its lib/ entry points through an "exports"
+    // wildcard that Jest's resolver does not expand, so @langchain/anthropic's
+    // require of one fails to resolve. Point at the CJS build directly.
+    "^@anthropic-ai/sdk/lib/(.*)$": "<rootDir>/node_modules/@anthropic-ai/sdk/lib/$1.js",
+    "^@agentclientprotocol/sdk$": "<rootDir>/__mocks__/@agentclientprotocol/sdk.js",
+    "^@anthropic-ai/claude-agent-sdk$": "<rootDir>/__mocks__/@anthropic-ai/claude-agent-sdk.js",
+    // react-resizable-panels is ESM-only with no CJS build to point at; stub it.
+    "^react-resizable-panels$": "<rootDir>/__mocks__/react-resizable-panels.js",
   },
-  testRegex: '(/tests/.*|(\\.|/)(test|spec))\\.(jsx?|tsx?)$',
-  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
-  testPathIgnorePatterns: ['/node_modules/'],
-  setupFiles: ['<rootDir>/jest.setup.js'],
+  testRegex: ".*\\.test\\.(jsx?|tsx?)$",
+  moduleFileExtensions: ["ts", "tsx", "js", "jsx", "json", "node", "md"],
+  testPathIgnorePatterns: ["/node_modules/"],
+  // Markdown shipped by the openartifacts package goes through the text transform above.
+  transformIgnorePatterns: [
+    "[/\\\\]node_modules[/\\\\](?!openartifacts[/\\\\])",
+    "\\.pnp\\.[^\\/]+$",
+  ],
+  setupFiles: ["<rootDir>/jest.setup.js"],
 };
